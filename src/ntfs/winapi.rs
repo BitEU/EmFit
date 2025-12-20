@@ -1,0 +1,431 @@
+//! Windows API bindings for NTFS operations
+//!
+//! Safe wrappers around Win32 APIs for volume access and IOCTL operations.
+
+use crate::error::{Result, RustyScanError};
+use crate::ntfs::structs::*;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::ptr;
+
+// ============================================================================
+// IOCTL Control Codes (from winioctl.h and our reverse engineering)
+// ============================================================================
+
+// Standard NTFS IOCTLs
+pub const FSCTL_GET_NTFS_VOLUME_DATA: u32 = 0x00090064;
+pub const FSCTL_GET_NTFS_FILE_RECORD: u32 = 0x00090068;
+pub const FSCTL_GET_VOLUME_BITMAP: u32 = 0x0009006F;
+pub const FSCTL_GET_RETRIEVAL_POINTERS: u32 = 0x00090073;
+pub const FSCTL_ENUM_USN_DATA: u32 = 0x000900B3;
+pub const FSCTL_READ_USN_JOURNAL: u32 = 0x000900BB;
+pub const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
+pub const FSCTL_DELETE_USN_JOURNAL: u32 = 0x000900F8;
+pub const FSCTL_CREATE_USN_JOURNAL: u32 = 0x000900E7;
+
+// Disk geometry
+pub const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x00070000;
+
+// File attributes for CreateFile
+pub const GENERIC_READ: u32 = 0x80000000;
+pub const GENERIC_WRITE: u32 = 0x40000000;
+pub const FILE_SHARE_READ: u32 = 0x00000001;
+pub const FILE_SHARE_WRITE: u32 = 0x00000002;
+pub const FILE_SHARE_DELETE: u32 = 0x00000004;
+pub const OPEN_EXISTING: u32 = 3;
+pub const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+pub const INVALID_HANDLE_VALUE: isize = -1;
+
+// ============================================================================
+// Safe Handle Wrapper
+// ============================================================================
+
+/// RAII wrapper for Windows HANDLE
+pub struct SafeHandle {
+    handle: isize,
+}
+
+impl SafeHandle {
+    /// Create from raw handle
+    pub fn new(handle: isize) -> Option<Self> {
+        if handle == INVALID_HANDLE_VALUE || handle == 0 {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+
+    /// Get raw handle value
+    pub fn as_raw(&self) -> isize {
+        self.handle
+    }
+
+    /// Check if handle is valid
+    pub fn is_valid(&self) -> bool {
+        self.handle != INVALID_HANDLE_VALUE && self.handle != 0
+    }
+}
+
+impl Drop for SafeHandle {
+    fn drop(&mut self) {
+        if self.is_valid() {
+            unsafe {
+                windows::Win32::Foundation::CloseHandle(
+                    windows::Win32::Foundation::HANDLE(self.handle as *mut std::ffi::c_void)
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Volume Operations
+// ============================================================================
+
+/// Open a volume for raw read access
+pub fn open_volume(drive_letter: char) -> Result<SafeHandle> {
+    let path = format!("\\\\.\\{}:", drive_letter);
+    open_volume_path(&path)
+}
+
+/// Open a volume by path
+pub fn open_volume_path(path: &str) -> Result<SafeHandle> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::core::PCWSTR;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            GENERIC_READ,
+            FILE_SHARE_MODE(FILE_SHARE_READ | FILE_SHARE_WRITE),
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_NO_BUFFERING),
+            HANDLE::default(),
+        )
+    };
+
+    match handle {
+        Ok(h) => SafeHandle::new(h.0 as isize)
+            .ok_or_else(|| RustyScanError::VolumeOpenError(path.to_string(), std::io::Error::last_os_error())),
+        Err(e) => Err(RustyScanError::VolumeOpenError(path.to_string(), std::io::Error::from_raw_os_error(e.code().0 as i32))),
+    }
+}
+
+/// Open a file by path with read access
+pub fn open_file_read(path: &str) -> Result<SafeHandle> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::core::PCWSTR;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            GENERIC_READ,
+            FILE_SHARE_MODE(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS),
+            HANDLE::default(),
+        )
+    };
+
+    match handle {
+        Ok(h) => SafeHandle::new(h.0 as isize)
+            .ok_or_else(|| RustyScanError::IoError(std::io::Error::last_os_error())),
+        Err(e) => Err(RustyScanError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))),
+    }
+}
+
+// ============================================================================
+// IOCTL Operations
+// ============================================================================
+
+/// Send a DeviceIoControl request
+pub fn device_io_control(
+    handle: &SafeHandle,
+    control_code: u32,
+    in_buffer: Option<&[u8]>,
+    out_buffer: &mut [u8],
+) -> Result<u32> {
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::Foundation::HANDLE;
+
+    let mut bytes_returned: u32 = 0;
+
+    let (in_ptr, in_size) = match in_buffer {
+        Some(buf) => (buf.as_ptr() as *const std::ffi::c_void, buf.len() as u32),
+        None => (ptr::null(), 0),
+    };
+
+    let result = unsafe {
+        DeviceIoControl(
+            HANDLE(handle.as_raw() as *mut std::ffi::c_void),
+            control_code,
+            Some(in_ptr),
+            in_size,
+            Some(out_buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            out_buffer.len() as u32,
+            Some(&mut bytes_returned),
+            None,
+        )
+    };
+
+    if result.is_ok() {
+        Ok(bytes_returned)
+    } else {
+        let error = std::io::Error::last_os_error();
+        Err(RustyScanError::WindowsError(format!(
+            "DeviceIoControl(0x{:08X}) failed: {}",
+            control_code, error
+        )))
+    }
+}
+
+/// Get NTFS volume data
+pub fn get_ntfs_volume_data(handle: &SafeHandle) -> Result<NtfsVolumeData> {
+    let mut buffer = [0u8; 0x60];
+    device_io_control(handle, FSCTL_GET_NTFS_VOLUME_DATA, None, &mut buffer)?;
+
+    NtfsVolumeData::from_bytes(&buffer).ok_or_else(|| {
+        RustyScanError::VolumeDataError("Failed to parse NTFS volume data".to_string())
+    })
+}
+
+/// Query USN Journal information
+pub fn query_usn_journal(handle: &SafeHandle) -> Result<UsnJournalData> {
+    let mut buffer = [0u8; 0x38];
+
+    match device_io_control(handle, FSCTL_QUERY_USN_JOURNAL, None, &mut buffer) {
+        Ok(_) => UsnJournalData::from_bytes(&buffer).ok_or_else(|| {
+            RustyScanError::UsnJournalError("Failed to parse USN journal data".to_string())
+        }),
+        Err(e) => {
+            // Check for "journal not active" error
+            let error_str = e.to_string();
+            if error_str.contains("1178") || error_str.contains("1179") {
+                Err(RustyScanError::UsnJournalNotActive("Volume".to_string()))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Read raw bytes from volume at specified offset
+pub fn read_volume_at(handle: &SafeHandle, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+    use windows::Win32::Storage::FileSystem::{ReadFile, SetFilePointerEx};
+    use windows::Win32::Foundation::HANDLE;
+
+    // Seek to offset
+    let mut new_pos: i64 = 0;
+    let seek_result = unsafe {
+        SetFilePointerEx(
+            HANDLE(handle.as_raw() as *mut std::ffi::c_void),
+            offset as i64,
+            Some(&mut new_pos),
+            windows::Win32::Storage::FileSystem::FILE_BEGIN,
+        )
+    };
+
+    if seek_result.is_err() {
+        return Err(RustyScanError::IoError(std::io::Error::last_os_error()));
+    }
+
+    // Read data
+    let mut bytes_read: u32 = 0;
+    let read_result = unsafe {
+        ReadFile(
+            HANDLE(handle.as_raw() as *mut std::ffi::c_void),
+            Some(buffer),
+            Some(&mut bytes_read),
+            None,
+        )
+    };
+
+    if read_result.is_ok() {
+        Ok(bytes_read as usize)
+    } else {
+        Err(RustyScanError::IoError(std::io::Error::last_os_error()))
+    }
+}
+
+// ============================================================================
+// MFT Enumeration via USN
+// ============================================================================
+
+/// Input structure for FSCTL_ENUM_USN_DATA
+#[repr(C, packed)]
+pub struct MftEnumData {
+    pub start_file_reference_number: u64,
+    pub low_usn: i64,
+    pub high_usn: i64,
+}
+
+/// Enumerate USN data (all files on volume)
+pub fn enum_usn_data(
+    handle: &SafeHandle,
+    start_frn: u64,
+    high_usn: i64,
+    buffer: &mut [u8],
+) -> Result<(u64, usize)> {
+    let input = MftEnumData {
+        start_file_reference_number: start_frn,
+        low_usn: 0,
+        high_usn,
+    };
+
+    let input_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &input as *const MftEnumData as *const u8,
+            std::mem::size_of::<MftEnumData>(),
+        )
+    };
+
+    let bytes_returned = device_io_control(handle, FSCTL_ENUM_USN_DATA, Some(input_bytes), buffer)?;
+
+    if bytes_returned < 8 {
+        return Ok((0, 0));
+    }
+
+    // First 8 bytes are the next file reference number
+    let next_frn = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+
+    Ok((next_frn, bytes_returned as usize))
+}
+
+// ============================================================================
+// USN Journal Reading
+// ============================================================================
+
+/// Input structure for FSCTL_READ_USN_JOURNAL
+#[repr(C, packed)]
+pub struct ReadUsnJournalData {
+    pub start_usn: i64,
+    pub reason_mask: u32,
+    pub return_only_on_close: u32,
+    pub timeout: u64,
+    pub bytes_to_wait_for: u64,
+    pub usn_journal_id: u64,
+}
+
+/// Read USN journal entries
+pub fn read_usn_journal(
+    handle: &SafeHandle,
+    journal_id: u64,
+    start_usn: i64,
+    reason_mask: u32,
+    buffer: &mut [u8],
+) -> Result<(i64, usize)> {
+    let input = ReadUsnJournalData {
+        start_usn,
+        reason_mask,
+        return_only_on_close: 0,
+        timeout: 0,
+        bytes_to_wait_for: 0,
+        usn_journal_id: journal_id,
+    };
+
+    let input_bytes = unsafe {
+        std::slice::from_raw_parts(
+            &input as *const ReadUsnJournalData as *const u8,
+            std::mem::size_of::<ReadUsnJournalData>(),
+        )
+    };
+
+    let bytes_returned =
+        device_io_control(handle, FSCTL_READ_USN_JOURNAL, Some(input_bytes), buffer)?;
+
+    if bytes_returned < 8 {
+        return Ok((start_usn, 0));
+    }
+
+    // First 8 bytes are the next USN
+    let next_usn = i64::from_le_bytes(buffer[0..8].try_into().unwrap());
+
+    Ok((next_usn, bytes_returned as usize))
+}
+
+// ============================================================================
+// Retrieval Pointers (for fragmented MFT)
+// ============================================================================
+
+/// Get retrieval pointers for a file (cluster extents)
+#[derive(Debug, Clone)]
+pub struct Extent {
+    pub vcn: u64,
+    pub lcn: u64,
+    pub cluster_count: u64,
+}
+
+pub fn get_retrieval_pointers(handle: &SafeHandle, start_vcn: u64) -> Result<Vec<Extent>> {
+    let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+
+    let input = start_vcn.to_le_bytes();
+
+    let bytes_returned =
+        device_io_control(handle, FSCTL_GET_RETRIEVAL_POINTERS, Some(&input), &mut buffer)?;
+
+    if bytes_returned < 16 {
+        return Ok(Vec::new());
+    }
+
+    // Parse RETRIEVAL_POINTERS_BUFFER
+    let extent_count = u32::from_le_bytes(buffer[0..4].try_into().unwrap()) as usize;
+    let _starting_vcn = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
+
+    let mut extents = Vec::with_capacity(extent_count);
+    let mut pos = 16;
+    let mut prev_vcn = start_vcn;
+
+    for _ in 0..extent_count {
+        if pos + 16 > bytes_returned as usize {
+            break;
+        }
+
+        let next_vcn = u64::from_le_bytes(buffer[pos..pos + 8].try_into().unwrap());
+        let lcn = u64::from_le_bytes(buffer[pos + 8..pos + 16].try_into().unwrap());
+
+        extents.push(Extent {
+            vcn: prev_vcn,
+            lcn,
+            cluster_count: next_vcn - prev_vcn,
+        });
+
+        prev_vcn = next_vcn;
+        pos += 16;
+    }
+
+    Ok(extents)
+}
+
+// ============================================================================
+// Error Code Helpers
+// ============================================================================
+
+/// Get the last Windows error code
+pub fn get_last_error() -> u32 {
+    unsafe { windows::Win32::Foundation::GetLastError().0 }
+}
+
+/// Check if error indicates "journal not active"
+pub fn is_journal_not_active_error(code: u32) -> bool {
+    code == 1178 || code == 1179 // ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_DELETE_IN_PROGRESS
+}
