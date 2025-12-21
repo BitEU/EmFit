@@ -62,7 +62,8 @@ enum Commands {
         #[arg(short, long)]
         drive: char,
 
-        /// Search pattern
+        /// Search pattern (use -- before pattern if it starts with -)
+        #[arg(allow_hyphen_values = true)]
         pattern: String,
 
         /// Maximum results
@@ -131,7 +132,8 @@ enum Commands {
         #[arg(short, long)]
         drive: char,
 
-        /// Pattern to search for
+        /// Pattern to search for (use -- before pattern if it starts with -)
+        #[arg(allow_hyphen_values = true)]
         pattern: String,
     },
 
@@ -143,6 +145,13 @@ enum Commands {
 
         /// MFT record number to read
         record: u64,
+    },
+
+    /// Debug: count raw USN enumeration results
+    UsnCount {
+        /// Drive letter
+        #[arg(short, long)]
+        drive: char,
     },
 }
 
@@ -178,6 +187,8 @@ fn main() {
         Commands::Debug { drive, pattern } => cmd_debug(drive, &pattern),
 
         Commands::ReadMft { drive, record } => cmd_read_mft(drive, record),
+
+        Commands::UsnCount { drive } => cmd_usn_count(drive),
     };
 
     if let Err(e) = result {
@@ -821,6 +832,46 @@ fn cmd_read_mft(drive: char, record_num: u64) -> rustyscan::Result<()> {
             println!("  Failed to read record: {}", e);
         }
     }
+
+    Ok(())
+}
+
+/// Debug: count raw USN enumeration results
+fn cmd_usn_count(drive: char) -> rustyscan::Result<()> {
+    use rustyscan::ntfs::{open_volume, UsnScanner};
+
+    println!(
+        "{} Counting raw USN enumeration for {}:",
+        style("→").cyan().bold(),
+        drive.to_ascii_uppercase()
+    );
+
+    let handle = open_volume(drive)?;
+    let mut scanner = UsnScanner::new(handle);
+    scanner.initialize()?;
+
+    let mut file_count = 0u64;
+    let mut dir_count = 0u64;
+    let mut max_frn = 0u64;
+
+    println!("  Enumerating...");
+
+    scanner.enumerate_all(|entry| {
+        if entry.is_directory {
+            dir_count += 1;
+        } else {
+            file_count += 1;
+        }
+        if entry.record_number > max_frn {
+            max_frn = entry.record_number;
+        }
+    })?;
+
+    println!("\n  Results:");
+    println!("    Files: {}", file_count);
+    println!("    Directories: {}", dir_count);
+    println!("    Total: {}", file_count + dir_count);
+    println!("    Max FRN seen: {}", max_frn);
 
     Ok(())
 }

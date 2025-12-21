@@ -325,35 +325,82 @@ pub fn read_volume_at(handle: &SafeHandle, offset: u64, buffer: &mut [u8]) -> Re
 // MFT Enumeration via USN
 // ============================================================================
 
-/// Input structure for FSCTL_ENUM_USN_DATA
+/// Input structure for FSCTL_ENUM_USN_DATA (V0 - legacy, for Windows XP/2003)
 #[repr(C, packed)]
-pub struct MftEnumData {
+#[allow(dead_code)]
+pub struct MftEnumDataV0 {
     pub start_file_reference_number: u64,
     pub low_usn: i64,
     pub high_usn: i64,
 }
 
+/// Input structure for FSCTL_ENUM_USN_DATA (V1 - Windows 8+)
+/// This version includes min/max major version fields for filtering USN record versions
+#[repr(C, packed)]
+pub struct MftEnumDataV1 {
+    pub start_file_reference_number: u64,
+    pub low_usn: i64,
+    pub high_usn: i64,
+    pub min_major_version: u16,
+    pub max_major_version: u16,
+}
+
 /// Enumerate USN data (all files on volume)
+/// Uses V1 structure for Windows 8+ compatibility with USN record version 2 and 3
 pub fn enum_usn_data(
     handle: &SafeHandle,
     start_frn: u64,
     high_usn: i64,
     buffer: &mut [u8],
 ) -> Result<(u64, usize)> {
-    let input = MftEnumData {
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::Foundation::HANDLE;
+
+    // Use V1 structure to request both V2 and V3 USN records
+    let input = MftEnumDataV1 {
         start_file_reference_number: start_frn,
         low_usn: 0,
         high_usn,
+        min_major_version: 2,  // Accept V2 records
+        max_major_version: 3,  // Accept V3 records (128-bit file IDs)
     };
 
     let input_bytes = unsafe {
         std::slice::from_raw_parts(
-            &input as *const MftEnumData as *const u8,
-            std::mem::size_of::<MftEnumData>(),
+            &input as *const MftEnumDataV1 as *const u8,
+            std::mem::size_of::<MftEnumDataV1>(),
         )
     };
 
-    let bytes_returned = device_io_control(handle, FSCTL_ENUM_USN_DATA, Some(input_bytes), buffer)?;
+    let mut bytes_returned: u32 = 0;
+
+    let result = unsafe {
+        DeviceIoControl(
+            HANDLE(handle.as_raw() as *mut std::ffi::c_void),
+            FSCTL_ENUM_USN_DATA,
+            Some(input_bytes.as_ptr() as *const std::ffi::c_void),
+            input_bytes.len() as u32,
+            Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            buffer.len() as u32,
+            Some(&mut bytes_returned),
+            None,
+        )
+    };
+
+    if result.is_err() {
+        let error = std::io::Error::last_os_error();
+        let error_code = error.raw_os_error().unwrap_or(0);
+
+        // ERROR_HANDLE_EOF (38) means enumeration is complete - not an error
+        if error_code == 38 {
+            return Ok((0, 0));
+        }
+
+        return Err(RustyScanError::WindowsError(format!(
+            "DeviceIoControl(0x{:08X}) failed: {}",
+            FSCTL_ENUM_USN_DATA, error
+        )));
+    }
 
     if bytes_returned < 8 {
         return Ok((0, 0));

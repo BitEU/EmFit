@@ -102,13 +102,22 @@ impl UsnScanner {
 
             // Parse USN records from buffer (skip first 8 bytes which is next FRN)
             let mut offset = 8;
-            while offset + 60 < bytes_returned {
-                if let Some(record) = UsnRecord::from_bytes(&self.buffer[offset..]) {
-                    let record_len = record.record_length as usize;
-                    if record_len < 60 || offset + record_len > bytes_returned {
-                        break;
-                    }
+            // Minimum USN record is 60 bytes (V2) or 76 bytes (V3), but we check inside from_bytes
+            while offset + 8 < bytes_returned {
+                // First read record_length to know how big this record is
+                if offset + 4 > bytes_returned {
+                    break;
+                }
+                let record_len = u32::from_le_bytes(
+                    self.buffer[offset..offset + 4].try_into().unwrap_or([0; 4])
+                ) as usize;
 
+                // Sanity check record length
+                if record_len < 60 || record_len > 0x10000 || offset + record_len > bytes_returned {
+                    break;
+                }
+
+                if let Some(record) = UsnRecord::from_bytes(&self.buffer[offset..offset + record_len]) {
                     let entry = UsnEntry {
                         record_number: record.file_record_number(),
                         parent_record_number: record.parent_record_number(),
@@ -122,7 +131,8 @@ impl UsnScanner {
 
                     offset += record_len;
                 } else {
-                    break;
+                    // Skip this record and try the next
+                    offset += record_len;
                 }
             }
 

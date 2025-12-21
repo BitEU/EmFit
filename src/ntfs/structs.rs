@@ -622,40 +622,76 @@ pub struct UsnRecord {
 
 impl UsnRecord {
     /// Parse a USN record (V2 or V3)
+    /// V2 record minimum size: 60 bytes (header) + filename
+    /// V3 record minimum size: 76 bytes (header) + filename
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 60 {
+        if data.len() < 8 {
             return None;
         }
 
-        let mut cursor = Cursor::new(data);
+        let record_length = u32::from_le_bytes(data[0..4].try_into().ok()?);
+        let major_version = u16::from_le_bytes(data[4..6].try_into().ok()?);
+        let minor_version = u16::from_le_bytes(data[6..8].try_into().ok()?);
 
-        let record_length = cursor.read_u32::<LittleEndian>().ok()?;
-        let major_version = cursor.read_u16::<LittleEndian>().ok()?;
-        let minor_version = cursor.read_u16::<LittleEndian>().ok()?;
+        // Determine minimum size based on version
+        let min_size = if major_version >= 3 { 76 } else { 60 };
+        if data.len() < min_size {
+            return None;
+        }
 
-        // V2 vs V3 handling
-        let (file_ref, parent_ref) = if major_version >= 3 {
-            // V3: 128-bit references (we only use lower 64 bits)
-            let file_ref = cursor.read_u64::<LittleEndian>().ok()?;
-            let _file_ref_high = cursor.read_u64::<LittleEndian>().ok()?;
-            let parent_ref = cursor.read_u64::<LittleEndian>().ok()?;
-            let _parent_ref_high = cursor.read_u64::<LittleEndian>().ok()?;
-            (file_ref, parent_ref)
+        // V2 vs V3 have different layouts
+        let (file_ref, parent_ref, usn, timestamp, reason, source_info, security_id,
+             file_attributes, file_name_length, file_name_offset) = if major_version >= 3 {
+            // V3 layout: 128-bit file references
+            // Offset 8: FileReferenceNumber (16 bytes)
+            // Offset 24: ParentFileReferenceNumber (16 bytes)
+            // Offset 40: Usn (8 bytes)
+            // Offset 48: TimeStamp (8 bytes)
+            // Offset 56: Reason (4 bytes)
+            // Offset 60: SourceInfo (4 bytes)
+            // Offset 64: SecurityId (4 bytes)
+            // Offset 68: FileAttributes (4 bytes)
+            // Offset 72: FileNameLength (2 bytes)
+            // Offset 74: FileNameOffset (2 bytes)
+            // Offset 76: FileName (variable)
+            let file_ref = u64::from_le_bytes(data[8..16].try_into().ok()?);
+            let parent_ref = u64::from_le_bytes(data[24..32].try_into().ok()?);
+            let usn = u64::from_le_bytes(data[40..48].try_into().ok()?);
+            let timestamp = u64::from_le_bytes(data[48..56].try_into().ok()?);
+            let reason = u32::from_le_bytes(data[56..60].try_into().ok()?);
+            let source_info = u32::from_le_bytes(data[60..64].try_into().ok()?);
+            let security_id = u32::from_le_bytes(data[64..68].try_into().ok()?);
+            let file_attributes = u32::from_le_bytes(data[68..72].try_into().ok()?);
+            let file_name_length = u16::from_le_bytes(data[72..74].try_into().ok()?);
+            let file_name_offset = u16::from_le_bytes(data[74..76].try_into().ok()?);
+            (file_ref, parent_ref, usn, timestamp, reason, source_info, security_id,
+             file_attributes, file_name_length, file_name_offset)
         } else {
-            // V2: 64-bit references
-            let file_ref = cursor.read_u64::<LittleEndian>().ok()?;
-            let parent_ref = cursor.read_u64::<LittleEndian>().ok()?;
-            (file_ref, parent_ref)
+            // V2 layout: 64-bit file references
+            // Offset 8: FileReferenceNumber (8 bytes)
+            // Offset 16: ParentFileReferenceNumber (8 bytes)
+            // Offset 24: Usn (8 bytes)
+            // Offset 32: TimeStamp (8 bytes)
+            // Offset 40: Reason (4 bytes)
+            // Offset 44: SourceInfo (4 bytes)
+            // Offset 48: SecurityId (4 bytes)
+            // Offset 52: FileAttributes (4 bytes)
+            // Offset 56: FileNameLength (2 bytes)
+            // Offset 58: FileNameOffset (2 bytes)
+            // Offset 60: FileName (variable)
+            let file_ref = u64::from_le_bytes(data[8..16].try_into().ok()?);
+            let parent_ref = u64::from_le_bytes(data[16..24].try_into().ok()?);
+            let usn = u64::from_le_bytes(data[24..32].try_into().ok()?);
+            let timestamp = u64::from_le_bytes(data[32..40].try_into().ok()?);
+            let reason = u32::from_le_bytes(data[40..44].try_into().ok()?);
+            let source_info = u32::from_le_bytes(data[44..48].try_into().ok()?);
+            let security_id = u32::from_le_bytes(data[48..52].try_into().ok()?);
+            let file_attributes = u32::from_le_bytes(data[52..56].try_into().ok()?);
+            let file_name_length = u16::from_le_bytes(data[56..58].try_into().ok()?);
+            let file_name_offset = u16::from_le_bytes(data[58..60].try_into().ok()?);
+            (file_ref, parent_ref, usn, timestamp, reason, source_info, security_id,
+             file_attributes, file_name_length, file_name_offset)
         };
-
-        let usn = cursor.read_u64::<LittleEndian>().ok()?;
-        let timestamp = cursor.read_u64::<LittleEndian>().ok()?;
-        let reason = cursor.read_u32::<LittleEndian>().ok()?;
-        let source_info = cursor.read_u32::<LittleEndian>().ok()?;
-        let security_id = cursor.read_u32::<LittleEndian>().ok()?;
-        let file_attributes = cursor.read_u32::<LittleEndian>().ok()?;
-        let file_name_length = cursor.read_u16::<LittleEndian>().ok()?;
-        let file_name_offset = cursor.read_u16::<LittleEndian>().ok()?;
 
         // Read filename
         let name_start = file_name_offset as usize;
