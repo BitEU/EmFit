@@ -4,6 +4,8 @@
 //! Supports path resolution, size aggregation, and efficient traversal.
 
 use crate::ntfs::{FileEntry, UsnEntry};
+use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
+use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, SafeHandle};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -112,6 +114,8 @@ pub struct FileTree {
     root_record: u64,
     /// Statistics
     pub stats: TreeStats,
+    /// Bytes per MFT record (for on-demand parent resolution)
+    bytes_per_record: u32,
 }
 
 /// Statistics about the tree
@@ -133,7 +137,24 @@ impl FileTree {
             nodes: DashMap::new(),
             root_record: 5, // NTFS root is always record 5
             stats: TreeStats::default(),
+            bytes_per_record: 1024, // Default MFT record size
         }
+    }
+
+    /// Create a new file tree with volume info for on-demand parent resolution
+    pub fn with_volume_info(drive_letter: char, bytes_per_record: u32) -> Self {
+        Self {
+            drive_letter,
+            nodes: DashMap::new(),
+            root_record: 5,
+            stats: TreeStats::default(),
+            bytes_per_record,
+        }
+    }
+
+    /// Set bytes per record (for on-demand parent resolution)
+    pub fn set_bytes_per_record(&mut self, bytes_per_record: u32) {
+        self.bytes_per_record = bytes_per_record;
     }
 
     /// Insert a node into the tree
@@ -184,15 +205,107 @@ impl FileTree {
     }
 
     /// Build full path for a record
+    ///
+    /// This method walks up the parent chain to construct the full path.
+    /// If a parent is missing from the tree, it will attempt to fetch it
+    /// on-demand using FSCTL_GET_NTFS_FILE_RECORD and cache it for future use.
     pub fn build_path(&self, record_number: u64) -> String {
+        self.build_path_internal(record_number, false)
+    }
+
+    /// Build path with optional debug output
+    pub fn build_path_debug(&self, record_number: u64) -> String {
+        self.build_path_internal(record_number, true)
+    }
+
+    fn build_path_internal(&self, record_number: u64, debug: bool) -> String {
         let mut parts = Vec::new();
         let mut current = record_number;
 
+        // Lazily open volume handle only if we encounter a missing parent
+        let mut volume_handle: Option<SafeHandle> = None;
+
         while current != self.root_record && current != 0 {
             if let Some(node) = self.nodes.get(&current) {
+                if debug {
+                    eprintln!("  [path] Record {} '{}' -> parent {}", current, node.name, node.parent_record_number);
+                }
                 parts.push(node.name.clone());
                 current = node.parent_record_number;
             } else {
+                if debug {
+                    eprintln!("  [path] Record {} NOT in tree, attempting fetch...", current);
+                }
+                // Parent not in tree - try to fetch it on-demand
+                if volume_handle.is_none() {
+                    match open_volume(self.drive_letter) {
+                        Ok(h) => {
+                            if debug {
+                                eprintln!("  [path] Opened volume {}:", self.drive_letter);
+                            }
+                            volume_handle = Some(h);
+                        }
+                        Err(e) => {
+                            if debug {
+                                eprintln!("  [path] Failed to open volume: {}", e);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(ref handle) = volume_handle {
+                    if debug {
+                        eprintln!("  [path] Calling get_ntfs_file_record({}, bytes={})", current, self.bytes_per_record);
+                    }
+                    match get_ntfs_file_record(handle, current, self.bytes_per_record) {
+                        Ok(data) => {
+                            if debug {
+                                eprintln!("  [path] Got {} bytes of MFT data", data.len());
+                                if data.len() >= 4 {
+                                    eprintln!("  [path] Signature: {:02X} {:02X} {:02X} {:02X}",
+                                        data[0], data[1], data[2], data[3]);
+                                }
+                            }
+                            let parse_result = if debug {
+                                extract_parent_info_debug(&data)
+                            } else {
+                                extract_parent_info(&data)
+                            };
+                            match parse_result {
+                                Some((name, parent)) => {
+                                    if debug {
+                                        eprintln!("  [path] Extracted: name='{}', parent={}", name, parent);
+                                    }
+                                    // Cache this record for future lookups
+                                    let node = TreeNode {
+                                        record_number: current,
+                                        parent_record_number: parent,
+                                        name: name.clone(),
+                                        is_directory: true,
+                                        ..Default::default()
+                                    };
+                                    self.nodes.insert(current, node);
+
+                                    parts.push(name);
+                                    current = parent;
+                                    continue;
+                                }
+                                None => {
+                                    if debug {
+                                        eprintln!("  [path] extract_parent_info returned None");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if debug {
+                                eprintln!("  [path] get_ntfs_file_record failed: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Failed to fetch parent - stop here
                 break;
             }
         }
@@ -336,6 +449,13 @@ impl TreeBuilder {
     pub fn new(drive_letter: char) -> Self {
         Self {
             tree: FileTree::new(drive_letter),
+        }
+    }
+
+    /// Create a builder with volume info for on-demand parent resolution
+    pub fn with_volume_info(drive_letter: char, bytes_per_record: u32) -> Self {
+        Self {
+            tree: FileTree::with_volume_info(drive_letter, bytes_per_record),
         }
     }
 

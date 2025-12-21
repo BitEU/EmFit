@@ -174,7 +174,11 @@ impl VolumeScanner {
         }
 
         // Phase 2: Try USN enumeration first (fast path)
-        let mut builder = TreeBuilder::new(self.drive_letter);
+        // Use volume info for on-demand parent resolution in path building
+        let mut builder = TreeBuilder::with_volume_info(
+            self.drive_letter,
+            volume_data.bytes_per_file_record_segment,
+        );
         let mut usn_success = false;
 
         if self.config.use_usn {

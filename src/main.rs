@@ -124,6 +124,26 @@ enum Commands {
         #[arg(short, long, default_value = "json")]
         format: String,
     },
+
+    /// Debug: trace a file's parent chain
+    Debug {
+        /// Drive letter
+        #[arg(short, long)]
+        drive: char,
+
+        /// Pattern to search for
+        pattern: String,
+    },
+
+    /// Read a specific MFT record directly
+    ReadMft {
+        /// Drive letter
+        #[arg(short, long)]
+        drive: char,
+
+        /// MFT record number to read
+        record: u64,
+    },
 }
 
 fn main() {
@@ -154,6 +174,10 @@ fn main() {
             output,
             format,
         } => cmd_export(drive, &output, &format),
+
+        Commands::Debug { drive, pattern } => cmd_debug(drive, &pattern),
+
+        Commands::ReadMft { drive, record } => cmd_read_mft(drive, record),
     };
 
     if let Err(e) = result {
@@ -558,6 +582,245 @@ fn cmd_export(drive: char, output: &str, format: &str) -> rustyscan::Result<()> 
         tree.len(),
         output
     );
+
+    Ok(())
+}
+
+/// Debug command - trace parent chain for a file
+fn cmd_debug(drive: char, pattern: &str) -> rustyscan::Result<()> {
+    println!(
+        "{} Debug: tracing parent chain for '{}' on {}:",
+        style("→").cyan().bold(),
+        style(pattern).yellow(),
+        drive.to_ascii_uppercase()
+    );
+
+    let config = ScanConfig {
+        use_usn: true,
+        use_mft: true,
+        calculate_sizes: false,
+        show_progress: true,
+        ..Default::default()
+    };
+
+    let mut scanner = VolumeScanner::new(drive).with_config(config);
+    let tree = scanner.scan()?;
+
+    // Find matching files
+    let results = tree.search(pattern, 10);
+    
+    if results.is_empty() {
+        println!("No matches found for '{}'", pattern);
+        return Ok(());
+    }
+
+    println!("\nFound {} matches:\n", results.len());
+
+    for result in results {
+        println!("=== {} ===", result.name);
+        println!("  Record Number: {}", result.record_number);
+        println!("  Displayed Path: {}", result.path);
+
+        // Try build_path_debug to see on-demand resolution
+        println!("\n  Attempting on-demand path resolution:");
+        let resolved_path = tree.build_path_debug(result.record_number);
+        println!("  Resolved Path: {}", resolved_path);
+
+        // Trace the parent chain manually
+        println!("\n  Parent Chain:");
+        let mut current = result.record_number;
+        let mut depth = 0;
+        
+        while depth < 20 {  // Prevent infinite loops
+            if let Some(node) = tree.get(current) {
+                println!("    [{}] Record {} -> '{}' (parent: {})", 
+                    depth, 
+                    node.record_number, 
+                    node.name,
+                    node.parent_record_number
+                );
+                
+                if node.parent_record_number == 5 {
+                    println!("    [{}] Record 5 -> ROOT", depth + 1);
+                    break;
+                }
+                
+                if node.parent_record_number == 0 || node.parent_record_number == node.record_number {
+                    println!("    [STOP] Invalid parent reference");
+                    break;
+                }
+                
+                // Check if parent exists
+                if tree.get(node.parent_record_number).is_none() {
+                    println!("    [MISSING] Parent record {} NOT FOUND in tree!", node.parent_record_number);
+                    
+                    // Let's see if it's a masking issue - check if full reference exists
+                    println!("    Checking nearby records...");
+                    for offset in 0..5u64 {
+                        let test_rec = node.parent_record_number + offset;
+                        if let Some(found) = tree.get(test_rec) {
+                            println!("      Found at {}: '{}'", test_rec, found.name);
+                        }
+                    }
+                    break;
+                }
+                
+                current = node.parent_record_number;
+            } else {
+                println!("    [MISSING] Record {} NOT FOUND in tree!", current);
+                break;
+            }
+            depth += 1;
+        }
+        println!();
+    }
+
+    // Also check specific known records
+    println!("\n=== Known Records Check ===");
+    for (name, expected_rec) in [("root", 5u64), ("$Recycle.Bin approx", 36u64)] {
+        if let Some(node) = tree.get(expected_rec) {
+            println!("  Record {}: '{}' (is_dir: {}, parent: {})", 
+                expected_rec, node.name, node.is_directory, node.parent_record_number);
+        } else {
+            println!("  Record {}: NOT FOUND (expected: {})", expected_rec, name);
+        }
+    }
+
+    // Check for the specific missing record if pattern contains a number
+    if let Ok(record_num) = pattern.parse::<u64>() {
+        println!("\n=== Direct Record Lookup: {} ===", record_num);
+        if let Some(node) = tree.get(record_num) {
+            println!("  Found: '{}' (is_dir: {}, parent: {})", 
+                node.name, node.is_directory, node.parent_record_number);
+        } else {
+            println!("  Record {} NOT FOUND in tree", record_num);
+        }
+    }
+
+    // Special check for record 253045 (the missing SID folder)
+    println!("\n=== Check for Record 253045 (suspected missing SID folder) ===");
+    if let Some(node) = tree.get(253045) {
+        println!("  Found: '{}' (is_dir: {}, parent: {})", 
+            node.name, node.is_directory, node.parent_record_number);
+    } else {
+        println!("  Record 253045 NOT FOUND in tree");
+        // Check children of $Recycle.Bin (record 36)
+        println!("\n  Children of $Recycle.Bin (record 36):");
+        if let Some(_recycle_bin) = tree.get(36) {
+            let children = tree.get_children(36);
+            if children.is_empty() {
+                println!("    No children found!");
+            } else {
+                for child in children.iter().take(20) {
+                    println!("    - Record {}: '{}' (parent: {})", 
+                        child.record_number, child.name, child.parent_record_number);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Read a specific MFT record directly
+fn cmd_read_mft(drive: char, record_num: u64) -> rustyscan::Result<()> {
+    use rustyscan::ntfs::{open_volume, MftParser};
+    use rustyscan::ntfs::winapi::get_ntfs_volume_data;
+
+    println!(
+        "{} Reading MFT record {} from {}:",
+        style("→").cyan().bold(),
+        style(record_num).yellow(),
+        drive.to_ascii_uppercase()
+    );
+
+    let handle = open_volume(drive)?;
+    let volume_data = get_ntfs_volume_data(&handle)?;
+    
+    println!("  Volume data:");
+    println!("    Bytes per sector: {}", volume_data.bytes_per_sector);
+    println!("    Bytes per cluster: {}", volume_data.bytes_per_cluster);
+    println!("    Bytes per MFT record: {}", volume_data.bytes_per_file_record_segment);
+    println!("    Total MFT records (est): {}", volume_data.estimated_mft_records());
+
+    let mut parser = MftParser::new(handle, volume_data.clone())?;
+    parser.load_mft_extents(drive)?;
+
+    let extents = parser.extents();
+    println!("\n  MFT Extents: {} (fragmented: {})", extents.len(), extents.len() > 1);
+    if !extents.is_empty() {
+        let record_size = volume_data.bytes_per_file_record_segment as u64;
+        let cluster_size = volume_data.bytes_per_cluster as u64;
+        let records_per_cluster = cluster_size / record_size;
+        
+        println!("  Records per cluster: {}", records_per_cluster);
+        println!("  Extent details:");
+        let mut total_records = 0u64;
+        for (i, ext) in extents.iter().enumerate() {
+            let records_in_extent = ext.cluster_count * records_per_cluster;
+            let start_record = total_records;
+            let end_record = start_record + records_in_extent - 1;
+            println!("    [{}] VCN: {}, LCN: {}, Clusters: {} -> Records {}-{}", 
+                i, ext.vcn, ext.lcn, ext.cluster_count, start_record, end_record);
+            total_records += records_in_extent;
+        }
+        println!("  Total records covered by extents: {}", total_records);
+        
+        // Check if record_num falls within extents
+        let target_vcn = record_num * record_size / cluster_size;
+        println!("\n  Target record {} is at VCN {}", record_num, target_vcn);
+        
+        let mut found = false;
+        for ext in extents.iter() {
+            if target_vcn >= ext.vcn && target_vcn < ext.vcn + ext.cluster_count {
+                println!("  -> Falls within extent VCN {}-{}", ext.vcn, ext.vcn + ext.cluster_count - 1);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("  -> WARNING: Target VCN {} is NOT within any extent!", target_vcn);
+        }
+    }
+    
+    println!("\n  Reading record {}...", record_num);
+    
+    match parser.read_record(record_num) {
+        Ok(mut data) => {
+            println!("  Raw data read successfully ({} bytes)", data.len());
+            
+            // Check the signature
+            let sig = &data[0..4];
+            println!("  Signature: {:02X} {:02X} {:02X} {:02X} (expect 46 49 4C 45 = 'FILE')", 
+                sig[0], sig[1], sig[2], sig[3]);
+            
+            // Parse the record
+            match parser.parse_record(record_num, &mut data) {
+                Ok(entry) => {
+                    println!("\n  Parsed MFT Record:");
+                    println!("    Name: '{}'", entry.name);
+                    println!("    Record Number: {}", entry.record_number);
+                    println!("    Parent Record: {}", entry.parent_record_number);
+                    println!("    Is Directory: {}", entry.is_directory);
+                    println!("    Is Valid (in use): {}", entry.is_valid);
+                    println!("    Is Complete: {}", entry.is_complete);
+                    println!("    File Size: {}", entry.file_size);
+                    println!("    Attributes: 0x{:08X}", entry.attributes);
+                    println!("    Hard Link Count: {}", entry.hard_link_count);
+                    
+                    if !entry.is_valid {
+                        println!("\n  WARNING: Record is marked as NOT IN USE!");
+                    }
+                }
+                Err(e) => {
+                    println!("  Failed to parse record: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Failed to read record: {}", e);
+        }
+    }
 
     Ok(())
 }

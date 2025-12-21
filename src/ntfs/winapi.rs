@@ -209,6 +209,60 @@ pub fn get_ntfs_volume_data(handle: &SafeHandle) -> Result<NtfsVolumeData> {
     })
 }
 
+/// Fetch a single MFT record using FSCTL_GET_NTFS_FILE_RECORD
+///
+/// This allows fetching any MFT record by number, even if it wasn't enumerated
+/// by the USN journal. Used for resolving missing parent directories.
+pub fn get_ntfs_file_record(
+    handle: &SafeHandle,
+    record_number: u64,
+    bytes_per_record: u32,
+) -> Result<Vec<u8>> {
+    // Input: 8-byte file reference number (record number in lower 48 bits)
+    let input = record_number.to_le_bytes();
+
+    // Output buffer: 8 (returned FRN) + 4 (record length) + record data
+    let buffer_size = 12 + bytes_per_record as usize;
+    let mut buffer = vec![0u8; buffer_size];
+
+    let bytes_returned = device_io_control(
+        handle,
+        FSCTL_GET_NTFS_FILE_RECORD,
+        Some(&input),
+        &mut buffer,
+    )?;
+
+    if bytes_returned < 12 {
+        return Err(RustyScanError::MftReadError(format!(
+            "Short response for record {}: {} bytes",
+            record_number, bytes_returned
+        )));
+    }
+
+    // The returned FRN tells us what record was actually returned
+    // (might be different if the requested record is not in use)
+    let returned_frn = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+    let returned_record = returned_frn & 0x0000_FFFF_FFFF_FFFF; // Lower 48 bits
+
+    if returned_record != record_number {
+        return Err(RustyScanError::MftReadError(format!(
+            "Record {} not in use (returned {})",
+            record_number, returned_record
+        )));
+    }
+
+    let record_length = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
+
+    if record_length == 0 || 12 + record_length > buffer.len() {
+        return Err(RustyScanError::MftReadError(format!(
+            "Invalid record length {} for record {}",
+            record_length, record_number
+        )));
+    }
+
+    Ok(buffer[12..12 + record_length].to_vec())
+}
+
 /// Query USN Journal information
 pub fn query_usn_journal(handle: &SafeHandle) -> Result<UsnJournalData> {
     let mut buffer = [0u8; 0x38];

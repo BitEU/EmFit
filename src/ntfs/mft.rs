@@ -127,6 +127,16 @@ impl MftParser {
         })
     }
 
+    /// Get number of MFT extents (0 = contiguous, >0 = fragmented)
+    pub fn extent_count(&self) -> usize {
+        self.mft_extents.len()
+    }
+
+    /// Get MFT extents for debugging
+    pub fn extents(&self) -> &[Extent] {
+        &self.mft_extents
+    }
+
     /// Get MFT extents by opening $MFT directly
     pub fn load_mft_extents(&mut self, drive_letter: char) -> Result<()> {
         let mft_path = format!("{}:\\$MFT", drive_letter);
@@ -137,11 +147,95 @@ impl MftParser {
                 Ok(())
             }
             Err(_) => {
-                // If we can't open $MFT directly, we'll read sequentially
-                self.mft_extents.clear();
-                Ok(())
+                // If we can't open $MFT directly, parse record 0 to get MFT extents
+                // Record 0 is the $MFT file itself, and its $DATA attribute contains
+                // the data runs that describe where the MFT is located on disk.
+                self.load_mft_extents_from_record_zero()
             }
         }
+    }
+
+    /// Load MFT extents by parsing record 0's data runs
+    fn load_mft_extents_from_record_zero(&mut self) -> Result<()> {
+        // Record 0 is always at the beginning of the MFT, which we can find
+        // from the volume data's MftStartLcn
+        let record_size = self.volume_data.bytes_per_file_record_segment as usize;
+        let mft_start = self.volume_data.mft_byte_offset();
+        
+        let mut buffer = vec![0u8; record_size];
+        let bytes_read = read_volume_at(&self.handle, mft_start, &mut buffer)?;
+        
+        if bytes_read < record_size {
+            return Ok(()); // Fallback: no extents, use linear calculation
+        }
+        
+        // Parse the MFT record header
+        let header = match MftRecordHeader::from_bytes(&buffer) {
+            Some(h) if h.is_valid() => h,
+            _ => return Ok(()), // Invalid record, use fallback
+        };
+        
+        // Apply fixup
+        if let Err(_) = self.apply_fixup(0, &mut buffer, &header) {
+            return Ok(()); // Fixup failed, use fallback
+        }
+        
+        // Parse attributes to find $DATA
+        let mut offset = header.first_attribute_offset as usize;
+        
+        while offset + 16 <= record_size && offset + 16 <= buffer.len() {
+            let attr_header = match AttributeHeader::from_bytes(&buffer[offset..]) {
+                Some(h) => h,
+                None => break,
+            };
+            
+            if attr_header.attribute_type == ATTRIBUTE_END_MARKER || attr_header.length == 0 {
+                break;
+            }
+            
+            if offset + attr_header.length as usize > buffer.len() {
+                break;
+            }
+            
+            // Look for $DATA attribute (type 0x80) with no name (main data stream)
+            if attr_header.attribute_type == 0x80 && attr_header.name_length == 0 && attr_header.non_resident {
+                let attr_data = &buffer[offset..offset + attr_header.length as usize];
+                
+                if let Some(nr_header) = NonResidentAttributeHeader::from_bytes(attr_data) {
+                    let runs_offset = nr_header.data_runs_offset as usize;
+                    if runs_offset < attr_data.len() {
+                        let (runs, _) = DataRun::decode_runs(&attr_data[runs_offset..]);
+                        
+                        // Convert DataRuns to Extents
+                        let mut current_lcn: i64 = 0;
+                        let mut current_vcn: u64 = 0;
+                        
+                        for run in runs {
+                            if run.is_sparse {
+                                current_vcn += run.cluster_count;
+                                continue;
+                            }
+                            
+                            current_lcn += run.lcn_offset;
+                            
+                            self.mft_extents.push(Extent {
+                                vcn: current_vcn,
+                                lcn: current_lcn as u64,
+                                cluster_count: run.cluster_count,
+                            });
+                            
+                            current_vcn += run.cluster_count;
+                        }
+                        
+                        break;
+                    }
+                }
+            }
+            
+            offset += attr_header.length as usize;
+        }
+        
+        Ok(())
     }
 
     /// Read a single MFT record by record number
@@ -515,4 +609,177 @@ impl MftParser {
 
         Ok(results)
     }
+}
+
+// ============================================================================
+// Standalone Functions for Parent Resolution
+// ============================================================================
+
+/// Extract just the file name and parent record number from a raw MFT record.
+///
+/// This is a lightweight function used for on-demand parent resolution when
+/// building file paths. It doesn't need an MftParser instance since it receives
+/// data from FSCTL_GET_NTFS_FILE_RECORD.
+///
+/// Returns (name, parent_record_number) or None if the record is invalid.
+pub fn extract_parent_info(data: &[u8]) -> Option<(String, u64)> {
+    extract_parent_info_internal(data, false)
+}
+
+/// Debug version with verbose output
+pub fn extract_parent_info_debug(data: &[u8]) -> Option<(String, u64)> {
+    extract_parent_info_internal(data, true)
+}
+
+fn extract_parent_info_internal(data: &[u8], debug: bool) -> Option<(String, u64)> {
+    // Parse and validate MFT record header
+    let header = MftRecordHeader::from_bytes(data)?;
+
+    if debug {
+        eprintln!("    [extract] Header: sig={:08X}, flags={:04X}, first_attr={}, in_use={}",
+            header.signature, header.flags, header.first_attribute_offset, header.is_in_use());
+    }
+
+    if !header.is_valid() {
+        if debug { eprintln!("    [extract] Invalid signature"); }
+        return None;
+    }
+    if !header.is_in_use() {
+        if debug { eprintln!("    [extract] Record not in use"); }
+        return None;
+    }
+
+    // Note: Data from FSCTL_GET_NTFS_FILE_RECORD does NOT need fixup applied.
+    // Fixup is only needed when reading raw sectors from disk.
+    // The Windows API returns already-valid record data.
+
+    // Find the best FILE_NAME attribute
+    let mut best_name: Option<(String, u64, FilenameNamespace)> = None;
+    let mut offset = header.first_attribute_offset as usize;
+    let record_size = data.len();
+    let mut attr_count = 0;
+
+    while offset + 16 <= record_size {
+        let attr_header = match AttributeHeader::from_bytes(&data[offset..]) {
+            Some(h) => h,
+            None => {
+                if debug { eprintln!("    [extract] Failed to parse attr header at offset {}", offset); }
+                break;
+            }
+        };
+
+        if debug {
+            eprintln!("    [extract] Attr[{}] at {}: type=0x{:X}, len={}, non_res={}",
+                attr_count, offset, attr_header.attribute_type, attr_header.length, attr_header.non_resident);
+        }
+
+        if attr_header.attribute_type == ATTRIBUTE_END_MARKER || attr_header.length == 0 {
+            if debug { eprintln!("    [extract] End marker or zero length"); }
+            break;
+        }
+
+        if offset + attr_header.length as usize > record_size {
+            if debug { eprintln!("    [extract] Attr extends past record"); }
+            break;
+        }
+
+        // Look for FILE_NAME attribute (type 0x30)
+        if attr_header.attribute_type == 0x30 && !attr_header.non_resident {
+            let attr_data = &data[offset..offset + attr_header.length as usize];
+
+            if let Some(res_header) = ResidentAttributeHeader::from_bytes(attr_data) {
+                let content_offset = res_header.value_offset as usize;
+                let content_len = res_header.value_length as usize;
+
+                if debug {
+                    eprintln!("    [extract] FILE_NAME: content_offset={}, content_len={}, attr_len={}",
+                        content_offset, content_len, attr_data.len());
+                }
+
+                if content_offset + content_len <= attr_data.len() {
+                    let content = &attr_data[content_offset..content_offset + content_len];
+
+                    if let Some(fn_attr) = FileNameAttribute::from_bytes(content) {
+                        let parent = fn_attr.parent_record_number();
+                        let ns = fn_attr.namespace;
+
+                        if debug {
+                            eprintln!("    [extract] Found name='{}', parent={}, namespace={:?}",
+                                fn_attr.name, parent, ns);
+                        }
+
+                        // Prefer Win32 or Win32+DOS namespace over DOS-only
+                        let dominated = match &best_name {
+                            None => true,
+                            Some((_, _, existing_ns)) => {
+                                match (ns, existing_ns) {
+                                    (FilenameNamespace::Win32, _) => true,
+                                    (FilenameNamespace::Win32AndDos, FilenameNamespace::Dos) => true,
+                                    (FilenameNamespace::Win32AndDos, FilenameNamespace::Posix) => true,
+                                    (FilenameNamespace::Posix, FilenameNamespace::Dos) => true,
+                                    _ => false,
+                                }
+                            }
+                        };
+
+                        if dominated {
+                            best_name = Some((fn_attr.name.clone(), parent, ns));
+                        }
+                    } else if debug {
+                        eprintln!("    [extract] FileNameAttribute::from_bytes failed");
+                    }
+                } else if debug {
+                    eprintln!("    [extract] Content extends past attr");
+                }
+            } else if debug {
+                eprintln!("    [extract] ResidentAttributeHeader::from_bytes failed");
+            }
+        }
+
+        offset += attr_header.length as usize;
+        attr_count += 1;
+    }
+
+    if debug {
+        eprintln!("    [extract] Final result: {:?}", best_name.as_ref().map(|(n, p, _)| (n.as_str(), *p)));
+    }
+
+    best_name.map(|(name, parent, _)| (name, parent))
+}
+
+/// Apply fixup array to MFT record data (standalone version)
+fn apply_fixup_standalone(data: &mut [u8], header: &MftRecordHeader) -> Result<()> {
+    let fixup_offset = header.update_sequence_offset as usize;
+    let fixup_count = header.update_sequence_size as usize;
+
+    if fixup_count < 2 || fixup_offset + fixup_count * 2 > data.len() {
+        return Err(RustyScanError::InvalidMftRecord(0, "Invalid fixup".to_string()));
+    }
+
+    // First 2 bytes of fixup array is the check value
+    let check_value = u16::from_le_bytes([data[fixup_offset], data[fixup_offset + 1]]);
+
+    // Each subsequent pair replaces the last 2 bytes of each sector
+    let sector_size = 512usize;
+
+    for i in 1..fixup_count {
+        let sector_end = (i * sector_size) - 2;
+
+        if sector_end + 2 > data.len() {
+            break;
+        }
+
+        // Verify the sector ends with the check value
+        let sector_value = u16::from_le_bytes([data[sector_end], data[sector_end + 1]]);
+        if sector_value != check_value {
+            return Err(RustyScanError::InvalidMftRecord(0, "Fixup mismatch".to_string()));
+        }
+
+        // Replace with original bytes from fixup array
+        let fixup_pos = fixup_offset + i * 2;
+        data[sector_end] = data[fixup_pos];
+        data[sector_end + 1] = data[fixup_pos + 1];
+    }
+
+    Ok(())
 }
