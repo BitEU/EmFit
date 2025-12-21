@@ -264,11 +264,11 @@ fn cmd_search(drive: char, pattern: &str, max_results: usize) -> rustyscan::Resu
 
     let start = Instant::now();
 
-    // Quick scan without full MFT for speed
+    // Use all available data sources for complete results
     let config = ScanConfig {
         use_usn: true,
-        use_mft: false, // Skip MFT for search (we don't need sizes)
-        calculate_sizes: false,
+        use_mft: true, // Always use MFT for complete file enumeration
+        calculate_sizes: false, // Skip size calculation for search speed
         show_progress: true,
         ..Default::default()
     };
