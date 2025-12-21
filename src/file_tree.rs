@@ -202,52 +202,72 @@ impl FileTree {
     }
 
     /// Calculate aggregated sizes (call after all nodes inserted)
+    /// Uses iterative post-order traversal to avoid stack overflow
     pub fn calculate_sizes(&self) {
-        // Process in reverse depth order (leaves first)
-        self.calculate_sizes_recursive(self.root_record);
-    }
-
-    fn calculate_sizes_recursive(&self, record_number: u64) -> (u64, u64, u64, u64) {
-        let children: Vec<u64> = {
-            if let Some(node) = self.nodes.get(&record_number) {
-                node.children.clone()
-            } else {
-                return (0, 0, 0, 0);
+        use std::collections::HashMap;
+        
+        // We need to process children before parents (post-order)
+        // Use iterative approach with explicit stack to avoid stack overflow
+        
+        // First pass: collect all nodes and their children in topological order
+        let mut to_visit = vec![self.root_record];
+        let mut visit_order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        
+        while let Some(record) = to_visit.pop() {
+            if visited.contains(&record) {
+                continue;
             }
-        };
-
-        let mut total_size = 0u64;
-        let mut total_allocated = 0u64;
-        let mut file_count = 0u64;
-        let mut dir_count = 0u64;
-
-        // Process children first
-        for child_id in children {
-            let (cs, ca, fc, dc) = self.calculate_sizes_recursive(child_id);
-            total_size += cs;
-            total_allocated += ca;
-            file_count += fc;
-            dir_count += dc;
-        }
-
-        // Update this node
-        if let Some(mut node) = self.nodes.get_mut(&record_number) {
-            total_size += node.file_size;
-            total_allocated += node.allocated_size;
-
-            if node.is_directory {
-                dir_count += 1;
-            } else {
-                file_count += 1;
+            visited.insert(record);
+            visit_order.push(record);
+            
+            if let Some(node) = self.nodes.get(&record) {
+                for &child in &node.children {
+                    if !visited.contains(&child) {
+                        to_visit.push(child);
+                    }
+                }
             }
-
-            node.total_size = total_size;
-            node.total_allocated = total_allocated;
-            node.file_count = file_count;
-            node.dir_count = dir_count;
         }
-
-        (total_size, total_allocated, file_count, dir_count)
+        
+        // Second pass: process in reverse order (leaves first)
+        // Store computed values in a separate map to avoid holding refs
+        let mut computed: HashMap<u64, (u64, u64, u64, u64)> = HashMap::new();
+        
+        for &record in visit_order.iter().rev() {
+            let (children, file_size, allocated_size, is_directory) = {
+                if let Some(node) = self.nodes.get(&record) {
+                    (node.children.clone(), node.file_size, node.allocated_size, node.is_directory)
+                } else {
+                    continue;
+                }
+            };
+            
+            let mut total_size = file_size;
+            let mut total_allocated = allocated_size;
+            let mut file_count = if is_directory { 0 } else { 1 };
+            let mut dir_count = if is_directory { 1 } else { 0 };
+            
+            // Sum up children's computed values
+            for child_id in children {
+                if let Some(&(cs, ca, fc, dc)) = computed.get(&child_id) {
+                    total_size += cs;
+                    total_allocated += ca;
+                    file_count += fc;
+                    dir_count += dc;
+                }
+            }
+            
+            computed.insert(record, (total_size, total_allocated, file_count, dir_count));
+            
+            // Update the node
+            if let Some(mut node) = self.nodes.get_mut(&record) {
+                node.total_size = total_size;
+                node.total_allocated = total_allocated;
+                node.file_count = file_count;
+                node.dir_count = dir_count;
+            }
+        }
     }
 
     /// Get total number of nodes
