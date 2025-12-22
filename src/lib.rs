@@ -50,6 +50,7 @@
 
 pub mod error;
 pub mod file_tree;
+pub mod gui;
 pub mod ntfs;
 pub mod scanner;
 

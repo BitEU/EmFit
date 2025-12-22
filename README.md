@@ -146,8 +146,11 @@ emfit/
 ## Building
 
 ```bash
-# Release build (optimized)
+# Release CLI build
 cargo build --release
+
+# Release GUI build
+cargo build --bin emfit-gui --release
 
 # Run tests
 cargo test
