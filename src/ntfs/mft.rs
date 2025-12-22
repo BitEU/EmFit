@@ -6,7 +6,7 @@
 use crate::error::{Result, RustyScanError};
 use crate::ntfs::structs::*;
 use crate::ntfs::winapi::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // Parsed File Entry
@@ -45,6 +45,8 @@ pub struct FileEntry {
     pub is_valid: bool,
     /// Has this record been fully parsed?
     pub is_complete: bool,
+    /// Extension MFT record numbers that may contain additional attributes (e.g., $FILE_NAME)
+    pub extension_records: Vec<u64>,
 }
 
 impl Default for FileEntry {
@@ -65,6 +67,7 @@ impl Default for FileEntry {
             alternate_streams: HashMap::new(),
             is_valid: false,
             is_complete: false,
+            extension_records: Vec::new(),
         }
     }
 }
@@ -205,25 +208,25 @@ impl MftParser {
                     let runs_offset = nr_header.data_runs_offset as usize;
                     if runs_offset < attr_data.len() {
                         let (runs, _) = DataRun::decode_runs(&attr_data[runs_offset..]);
-                        
+
                         // Convert DataRuns to Extents
-                        let mut current_lcn: i64 = 0;
+                        // Note: DataRun.lcn_offset already contains the absolute LCN
+                        // (decode_runs accumulates the offsets internally)
                         let mut current_vcn: u64 = 0;
-                        
+
                         for run in runs {
                             if run.is_sparse {
                                 current_vcn += run.cluster_count;
                                 continue;
                             }
-                            
-                            current_lcn += run.lcn_offset;
-                            
+
+                            // lcn_offset is already the absolute LCN, not a delta
                             self.mft_extents.push(Extent {
                                 vcn: current_vcn,
-                                lcn: current_lcn as u64,
+                                lcn: run.lcn_offset as u64,
                                 cluster_count: run.cluster_count,
                             });
-                            
+
                             current_vcn += run.cluster_count;
                         }
                         
@@ -319,6 +322,123 @@ impl MftParser {
         Ok(entry)
     }
 
+    /// Parse a raw MFT record and follow extension records if needed to get the file name
+    /// This version can read additional MFT records to resolve missing $FILE_NAME attributes
+    pub fn parse_record_with_extensions(&mut self, record_number: u64, data: &mut [u8]) -> Result<FileEntry> {
+        // First, parse the base record
+        let mut entry = self.parse_record(record_number, data)?;
+
+        // If we have extension records and no name, try to get the name from extension records
+        if entry.name.is_empty() && !entry.extension_records.is_empty() && entry.is_valid {
+            // Read extension records to find $FILE_NAME
+            let extension_records = std::mem::take(&mut entry.extension_records);
+
+            for ext_record_num in extension_records {
+                // Skip if it's the same as the base record
+                if ext_record_num == record_number {
+                    continue;
+                }
+
+                // Try to read and parse the extension record
+                match self.read_record(ext_record_num) {
+                    Ok(mut ext_data) => {
+                        if let Some((name, parent)) = self.extract_filename_from_extension(&mut ext_data) {
+                            if !name.is_empty() {
+                                entry.name = name;
+                                if entry.parent_record_number == 0 {
+                                    entry.parent_record_number = parent;
+                                }
+                                break; // Found a name, we're done
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Failed to read extension record, continue trying others
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Ok(entry)
+    }
+
+    /// Extract just the file name from an extension MFT record
+    fn extract_filename_from_extension(&self, data: &mut [u8]) -> Option<(String, u64)> {
+        // Parse header
+        let header = MftRecordHeader::from_bytes(data)?;
+
+        if !header.is_valid() {
+            return None;
+        }
+
+        // Apply fixup
+        if self.apply_fixup(0, data, &header).is_err() {
+            return None;
+        }
+
+        // Look for $FILE_NAME attribute
+        let record_size = self.volume_data.bytes_per_file_record_segment as usize;
+        let mut offset = header.first_attribute_offset as usize;
+        let mut best_name: Option<(String, u64, FilenameNamespace)> = None;
+
+        while offset + 16 <= record_size && offset + 16 <= data.len() {
+            let attr_header = match AttributeHeader::from_bytes(&data[offset..]) {
+                Some(h) => h,
+                None => break,
+            };
+
+            if attr_header.attribute_type == ATTRIBUTE_END_MARKER || attr_header.length == 0 {
+                break;
+            }
+
+            if offset + attr_header.length as usize > data.len() {
+                break;
+            }
+
+            // Look for FILE_NAME attribute (type 0x30)
+            if attr_header.attribute_type == 0x30 && !attr_header.non_resident {
+                let attr_data = &data[offset..offset + attr_header.length as usize];
+
+                if let Some(res_header) = ResidentAttributeHeader::from_bytes(attr_data) {
+                    let content_offset = res_header.value_offset as usize;
+                    let content_len = res_header.value_length as usize;
+
+                    if content_offset + content_len <= attr_data.len() {
+                        let content = &attr_data[content_offset..content_offset + content_len];
+
+                        if let Some(fn_attr) = FileNameAttribute::from_bytes(content) {
+                            let parent = fn_attr.parent_record_number();
+                            let ns = fn_attr.namespace;
+
+                            // Prefer Win32 or Win32+DOS namespace
+                            let dominated = match &best_name {
+                                None => true,
+                                Some((_, _, existing_ns)) => {
+                                    match (ns, existing_ns) {
+                                        (FilenameNamespace::Win32, _) => true,
+                                        (FilenameNamespace::Win32AndDos, FilenameNamespace::Dos) => true,
+                                        (FilenameNamespace::Win32AndDos, FilenameNamespace::Posix) => true,
+                                        (FilenameNamespace::Posix, FilenameNamespace::Dos) => true,
+                                        _ => false,
+                                    }
+                                }
+                            };
+
+                            if dominated {
+                                best_name = Some((fn_attr.name.clone(), parent, ns));
+                            }
+                        }
+                    }
+                }
+            }
+
+            offset += attr_header.length as usize;
+        }
+
+        best_name.map(|(name, parent, _)| (name, parent))
+    }
+
     /// Apply fixup array to repair sector boundaries
     ///
     /// NTFS stores the last 2 bytes of each sector in the fixup array
@@ -376,6 +496,9 @@ impl MftParser {
         // Track best filename (prefer Win32 namespace)
         let mut best_filename: Option<(FilenameNamespace, String)> = None;
 
+        // Track extension record numbers we need to read for $FILE_NAME
+        let mut extension_records: Vec<u64> = Vec::new();
+
         while offset + 16 <= record_size && offset + 16 <= data.len() {
             let attr_header = AttributeHeader::from_bytes(&data[offset..]).ok_or_else(|| {
                 RustyScanError::InvalidAttribute(offset as u32, "Failed to parse header".to_string())
@@ -426,7 +549,10 @@ impl MftParser {
                     self.parse_data_attribute(attr_data, &attr_header, entry)?;
                 }
                 Some(AttributeType::AttributeList) => {
-                    // TODO: Handle attribute lists for large files
+                    // Parse the attribute list to find extension records with $FILE_NAME
+                    if let Some(ext_records) = self.parse_attribute_list_for_filenames(attr_data, entry.record_number)? {
+                        extension_records.extend(ext_records);
+                    }
                 }
                 _ => {
                     // Skip other attributes
@@ -436,12 +562,68 @@ impl MftParser {
             offset += attr_header.length as usize;
         }
 
-        // Set final filename
+        // Set final filename from base record
         if let Some((_, name)) = best_filename {
             entry.name = name;
         }
 
+        // Store extension records for later processing by the caller
+        entry.extension_records = extension_records;
+
         Ok(())
+    }
+
+    /// Parse an Attribute List to find extension records containing $FILE_NAME
+    fn parse_attribute_list_for_filenames(
+        &self,
+        attr_data: &[u8],
+        base_record_number: u64,
+    ) -> Result<Option<Vec<u64>>> {
+        // Get the attribute list content
+        let attr_header = AttributeHeader::from_bytes(attr_data).ok_or_else(|| {
+            RustyScanError::InvalidAttribute(0, "Failed to parse attr list header".to_string())
+        })?;
+
+        let list_data = if attr_header.non_resident {
+            // Non-resident attribute list - we'd need to read the data runs
+            // This is rare for attribute lists, skip for now
+            return Ok(None);
+        } else {
+            // Resident - get the content directly
+            let res_header = ResidentAttributeHeader::from_bytes(attr_data).ok_or_else(|| {
+                RustyScanError::InvalidAttribute(0, "Failed to parse resident header".to_string())
+            })?;
+
+            let content_offset = res_header.value_offset as usize;
+            let content_len = res_header.value_length as usize;
+
+            if content_offset + content_len > attr_data.len() {
+                return Ok(None);
+            }
+
+            &attr_data[content_offset..content_offset + content_len]
+        };
+
+        // Parse the attribute list entries
+        let entries = parse_attribute_list(list_data);
+
+        // Find extension records that contain $FILE_NAME (type 0x30)
+        let mut extension_records = Vec::new();
+        for entry in entries {
+            // Look for FILE_NAME attributes in extension records
+            if entry.attribute_type == 0x30 {
+                let ext_record = entry.record_number();
+                if ext_record != base_record_number && !extension_records.contains(&ext_record) {
+                    extension_records.push(ext_record);
+                }
+            }
+        }
+
+        if extension_records.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(extension_records))
+        }
     }
 
     /// Parse $STANDARD_INFORMATION attribute
@@ -608,6 +790,99 @@ impl MftParser {
         }
 
         Ok(results)
+    }
+
+    /// Parse a batch of MFT records, efficiently resolving extension records for missing file names.
+    ///
+    /// This is a two-pass algorithm:
+    /// 1. First pass: Parse all records, collecting those that need extension record resolution
+    /// 2. Second pass: Batch-read all needed extension records and resolve missing names
+    ///
+    /// This is more efficient than reading extension records one-by-one as it minimizes disk seeks.
+    pub fn parse_batch_with_extensions(
+        &mut self,
+        batch: Vec<(u64, Vec<u8>)>,
+    ) -> Vec<FileEntry> {
+        let mut entries: Vec<FileEntry> = Vec::with_capacity(batch.len());
+        let mut needs_extension: Vec<usize> = Vec::new(); // Indices into entries that need extension resolution
+        let mut extension_record_set: HashSet<u64> = HashSet::new(); // All extension records we need to read
+
+        // First pass: Parse all records
+        for (record_num, mut data) in batch {
+            match self.parse_record(record_num, &mut data) {
+                Ok(entry) => {
+                    if entry.is_valid {
+                        // Check if this entry needs extension record resolution
+                        if entry.name.is_empty() && !entry.extension_records.is_empty() {
+                            // Collect all extension record numbers we need
+                            for ext_rec in &entry.extension_records {
+                                if *ext_rec != record_num {
+                                    extension_record_set.insert(*ext_rec);
+                                }
+                            }
+                            needs_extension.push(entries.len());
+                        }
+                        entries.push(entry);
+                    }
+                }
+                Err(_) => {
+                    // Skip invalid records
+                    continue;
+                }
+            }
+        }
+
+        // If no entries need extension resolution, we're done
+        if needs_extension.is_empty() {
+            return entries;
+        }
+
+        // Second pass: Read all extension records we need
+        // Group them by proximity for efficient reading
+        let mut extension_records: Vec<u64> = extension_record_set.into_iter().collect();
+        extension_records.sort_unstable();
+
+        // Read extension records and extract filenames
+        let mut extension_names: HashMap<u64, (String, u64)> = HashMap::new();
+
+        for ext_record_num in extension_records {
+            match self.read_record(ext_record_num) {
+                Ok(mut ext_data) => {
+                    if let Some((name, parent)) = self.extract_filename_from_extension(&mut ext_data) {
+                        if !name.is_empty() {
+                            extension_names.insert(ext_record_num, (name, parent));
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Failed to read extension record, continue
+                    continue;
+                }
+            }
+        }
+
+        // Third pass: Apply extension record names to entries that need them
+        for idx in needs_extension {
+            let entry = &mut entries[idx];
+
+            // Try each extension record for this entry until we find a name
+            for ext_rec in &entry.extension_records.clone() {
+                if let Some((name, parent)) = extension_names.get(ext_rec) {
+                    entry.name = name.clone();
+                    if entry.parent_record_number == 0 {
+                        entry.parent_record_number = *parent;
+                    }
+                    break; // Found a name, we're done with this entry
+                }
+            }
+        }
+
+        // Clear extension_records from all entries (no longer needed)
+        for entry in &mut entries {
+            entry.extension_records.clear();
+        }
+
+        entries
     }
 }
 

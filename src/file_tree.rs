@@ -546,6 +546,10 @@ impl FileTree {
             }
 
             let node = entry.value();
+            // Skip entries with no name (incomplete MFT records)
+            if node.name.is_empty() {
+                continue;
+            }
             if node.name.to_lowercase().contains(&pattern_lower) {
                 results.push(SearchResult {
                     record_number: node.record_number,
@@ -577,7 +581,7 @@ impl FileTree {
         let mut files: Vec<_> = self
             .nodes
             .iter()
-            .filter(|e| !e.value().is_directory)
+            .filter(|e| !e.value().is_directory && !e.value().name.is_empty())
             .map(|e| {
                 let node = e.value();
                 (node.record_number, node.file_size)

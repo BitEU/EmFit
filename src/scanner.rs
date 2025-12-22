@@ -300,7 +300,7 @@ impl VolumeScanner {
         let total_records = parser.estimated_records();
         let batch_size = self.config.batch_size;
         let mut processed = 0u64;
-        let mut entries = Vec::new();
+        let mut all_entries = Vec::new();
 
         while processed < total_records {
             if self.is_cancelled() {
@@ -311,30 +311,19 @@ impl VolumeScanner {
 
             match parser.read_records_batch(processed, batch_count) {
                 Ok(batch) => {
-                    for (record_num, mut data) in batch {
-                        match parser.parse_record(record_num, &mut data) {
-                            Ok(entry) => {
-                                if !entry.is_valid {
-                                    continue;
-                                }
+                    // Use the new batch processing method that handles extension records efficiently
+                    let batch_entries = parser.parse_batch_with_extensions(batch);
 
-                                // Filter
-                                if !self.config.include_hidden && entry.is_hidden() {
-                                    continue;
-                                }
-                                if !self.config.include_system && entry.is_system() {
-                                    continue;
-                                }
-
-                                entries.push(entry);
-                            }
-                            Err(e) => {
-                                // Log but continue on recoverable errors
-                                if !e.is_recoverable() {
-                                    // Could log warning here
-                                }
-                            }
+                    for entry in batch_entries {
+                        // Filter
+                        if !self.config.include_hidden && entry.is_hidden() {
+                            continue;
                         }
+                        if !self.config.include_system && entry.is_system() {
+                            continue;
+                        }
+
+                        all_entries.push(entry);
                     }
                 }
                 Err(e) => {
@@ -354,13 +343,13 @@ impl VolumeScanner {
                         "MFT: {}/{} records ({} files)",
                         processed,
                         total_records,
-                        entries.len()
+                        all_entries.len()
                     ));
                 }
             }
         }
 
-        builder.add_file_entries(entries.into_iter());
+        builder.add_file_entries(all_entries.into_iter());
         Ok(())
     }
 

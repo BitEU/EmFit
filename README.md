@@ -147,6 +147,30 @@ rustyscan volumes
 rustyscan monitor -d C
 ```
 
+### USN Journal debug: `usn-count`
+
+```bash
+# Count raw USN enumeration entries (fast)
+cargo run -- usn-count -d C
+
+# Or use the built binary:
+.\target\debug\rustyscan.exe usn-count -d C
+```
+
+Counts files and directories discovered via the USN journal and prints totals and the maximum FRN (file record number) seen. Example output:
+
+```
+Results:
+  Files: 123456
+  Directories: 2345
+  Total: 125801
+  Max FRN seen: 4324234
+```
+
+Notes:
+- Requires Administrator privileges to open the raw volume handle.
+- Very fast — useful for verifying USN coverage or debugging enumeration.
+
 ### Export Results
 
 ```bash

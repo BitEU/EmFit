@@ -762,6 +762,115 @@ pub mod usn_reason {
 }
 
 // ============================================================================
+// Attribute List Entry (for files with attributes in extension records)
+// ============================================================================
+
+/// Entry in an $ATTRIBUTE_LIST attribute
+/// Used when a file has too many attributes to fit in a single MFT record
+#[derive(Debug, Clone)]
+pub struct AttributeListEntry {
+    /// Attribute type (e.g., 0x30 for FILE_NAME, 0x80 for DATA)
+    pub attribute_type: u32,
+    /// Length of this entry
+    pub entry_length: u16,
+    /// Length of attribute name
+    pub name_length: u8,
+    /// Offset to attribute name
+    pub name_offset: u8,
+    /// Starting VCN (for non-resident attributes)
+    pub starting_vcn: u64,
+    /// MFT file reference where attribute is stored
+    pub mft_reference: u64,
+    /// Attribute ID
+    pub attribute_id: u16,
+    /// Attribute name (if any)
+    pub name: Option<String>,
+}
+
+impl AttributeListEntry {
+    /// Parse an attribute list entry from raw bytes
+    /// Returns the entry and the number of bytes consumed
+    pub fn from_bytes(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < 26 {
+            return None;
+        }
+
+        let attribute_type = u32::from_le_bytes(data[0..4].try_into().ok()?);
+        let entry_length = u16::from_le_bytes(data[4..6].try_into().ok()?);
+        let name_length = data[6];
+        let name_offset = data[7];
+        let starting_vcn = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let mft_reference = u64::from_le_bytes(data[16..24].try_into().ok()?);
+        let attribute_id = u16::from_le_bytes(data[24..26].try_into().ok()?);
+
+        // Sanity check
+        if entry_length < 26 || entry_length as usize > data.len() {
+            return None;
+        }
+
+        // Parse attribute name if present
+        let name = if name_length > 0 {
+            let name_start = name_offset as usize;
+            let name_bytes = name_length as usize * 2;
+            if name_start + name_bytes <= data.len() {
+                let name_data = &data[name_start..name_start + name_bytes];
+                let name_u16: Vec<u16> = name_data
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                Some(String::from_utf16_lossy(&name_u16))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Some((Self {
+            attribute_type,
+            entry_length,
+            name_length,
+            name_offset,
+            starting_vcn,
+            mft_reference,
+            attribute_id,
+            name,
+        }, entry_length as usize))
+    }
+
+    /// Get the MFT record number (lower 48 bits)
+    pub fn record_number(&self) -> u64 {
+        self.mft_reference & 0x0000_FFFF_FFFF_FFFF
+    }
+
+    /// Check if this entry points to an extension record (not the base record)
+    pub fn is_extension(&self, base_record_number: u64) -> bool {
+        self.record_number() != base_record_number
+    }
+}
+
+/// Parse all entries from an Attribute List
+pub fn parse_attribute_list(data: &[u8]) -> Vec<AttributeListEntry> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+
+    while offset + 26 <= data.len() {
+        match AttributeListEntry::from_bytes(&data[offset..]) {
+            Some((entry, consumed)) => {
+                if consumed == 0 {
+                    break;
+                }
+                entries.push(entry);
+                offset += consumed;
+            }
+            None => break,
+        }
+    }
+
+    entries
+}
+
+// ============================================================================
 // FILETIME conversion utilities
 // ============================================================================
 
