@@ -18,4 +18,7 @@ pub use structs::{
     NtfsVolumeData, StandardInformation, UsnJournalData, UsnRecord,
 };
 pub use usn::{ChangeEvent, ChangeReason, HybridScanner, UsnEntry, UsnMonitor, UsnScanner};
-pub use winapi::{open_volume, SafeHandle};
+pub use winapi::{
+    open_volume, open_volume_for_file_id, batch_get_file_metadata, get_file_metadata_by_id,
+    FileMetadata, SafeHandle,
+};

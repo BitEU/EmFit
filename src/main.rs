@@ -711,7 +711,7 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
     // Special check for record 253045 (the missing SID folder)
     println!("\n=== Check for Record 253045 (suspected missing SID folder) ===");
     if let Some(node) = tree.get(253045) {
-        println!("  Found: '{}' (is_dir: {}, parent: {})", 
+        println!("  Found: '{}' (is_dir: {}, parent: {})",
             node.name, node.is_directory, node.parent_record_number);
     } else {
         println!("  Record 253045 NOT FOUND in tree");
@@ -723,8 +723,37 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
                 println!("    No children found!");
             } else {
                 for child in children.iter().take(20) {
-                    println!("    - Record {}: '{}' (parent: {})", 
+                    println!("    - Record {}: '{}' (parent: {})",
                         child.record_number, child.name, child.parent_record_number);
+                }
+            }
+        }
+    }
+
+    // Test OpenFileById for matching files
+    println!("\n=== OpenFileById Test ===");
+    let results = tree.search(pattern, 10);
+    for result in &results {
+        if let Some(node) = tree.get(result.record_number) {
+            println!("  Testing record {} (FRN 0x{:016X}):",
+                node.record_number, node.file_reference_number);
+            println!("    MFT data: size={}, mod_time={}", node.file_size, node.modification_time);
+
+            // Try to get metadata via OpenFileById
+            match tree.refresh_single_metadata(node.record_number) {
+                Some((size, mod_time)) => {
+                    println!("    OpenFileById: size={}, mod_time={}", size, mod_time);
+                }
+                None => {
+                    println!("    OpenFileById: FAILED");
+                    // Try with full FRN using correct volume handle
+                    use emfit::ntfs::{open_volume_for_file_id, get_file_metadata_by_id};
+                    if let Ok(vol_handle) = open_volume_for_file_id(drive) {
+                        match get_file_metadata_by_id(&vol_handle, node.file_reference_number) {
+                            Ok(meta) => println!("    Direct FRN call: size={}", meta.file_size),
+                            Err(e) => println!("    Direct FRN call error: {}", e),
+                        }
+                    }
                 }
             }
         }

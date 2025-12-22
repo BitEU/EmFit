@@ -154,6 +154,43 @@ pub fn open_file_read(path: &str) -> Result<SafeHandle> {
     }
 }
 
+/// Open a volume root directory for use with OpenFileById
+///
+/// OpenFileById requires a handle to any file/directory on the volume,
+/// not a raw volume device handle. This opens the root directory.
+pub fn open_volume_for_file_id(drive_letter: char) -> Result<SafeHandle> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::core::PCWSTR;
+
+    // Open the root directory of the volume (e.g., "C:\")
+    let path = format!("{}:\\", drive_letter);
+    let wide_path: Vec<u16> = OsStr::new(&path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(wide_path.as_ptr()),
+            GENERIC_READ,
+            FILE_SHARE_MODE(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS), // Required for directories
+            HANDLE::default(),
+        )
+    };
+
+    match handle {
+        Ok(h) => SafeHandle::new(h.0 as isize)
+            .ok_or_else(|| EmFitError::VolumeOpenError(path, std::io::Error::last_os_error())),
+        Err(e) => Err(EmFitError::VolumeOpenError(path, std::io::Error::from_raw_os_error(e.code().0 as i32))),
+    }
+}
+
 // ============================================================================
 // IOCTL Operations
 // ============================================================================
@@ -529,4 +566,182 @@ pub fn get_last_error() -> u32 {
 /// Check if error indicates "journal not active"
 pub fn is_journal_not_active_error(code: u32) -> bool {
     code == 1178 || code == 1179 // ERROR_JOURNAL_NOT_ACTIVE, ERROR_JOURNAL_DELETE_IN_PROGRESS
+}
+
+// ============================================================================
+// File Metadata via OpenFileById
+// ============================================================================
+
+/// File metadata retrieved from the filesystem (not MFT)
+#[derive(Debug, Clone, Default)]
+pub struct FileMetadata {
+    pub file_size: u64,
+    pub creation_time: u64,
+    pub modification_time: u64,
+    pub access_time: u64,
+    pub attributes: u32,
+}
+
+/// Open a file by its MFT record number (File Reference Number)
+///
+/// This uses the Windows OpenFileById API to open a file using just its
+/// FRN and volume handle, without needing to know the file's path.
+///
+/// Returns a handle that can be used with GetFileInformationByHandle.
+fn open_file_by_id(volume_handle: &SafeHandle, file_id: u64) -> Result<SafeHandle> {
+    use windows::Win32::Foundation::HANDLE;
+
+    // FILE_ID_DESCRIPTOR structure for OpenFileById
+    // The Windows SDK defines this with a union that's 16 bytes to accommodate:
+    // - FileId (8 bytes for 64-bit FRN)
+    // - ObjectId (16 bytes GUID)
+    // - ExtendedFileId (16 bytes for 128-bit file ID)
+    // Total size must be 24 bytes: 4 (dw_size) + 4 (id_type) + 16 (union)
+    #[repr(C)]
+    struct FileIdDescriptor {
+        dw_size: u32,
+        id_type: u32,   // 0 = FileIdType (64-bit), 1 = ObjectIdType, 2 = ExtendedFileIdType
+        file_id: u64,   // The 64-bit file reference number
+        _padding: u64,  // Padding to make union 16 bytes total
+    }
+
+    let descriptor = FileIdDescriptor {
+        dw_size: std::mem::size_of::<FileIdDescriptor>() as u32, // Should be 24
+        id_type: 0, // FileIdType
+        file_id,
+        _padding: 0,
+    };
+
+    // OpenFileById is available on Windows Vista+
+    // We need to load it dynamically to maintain compatibility
+    let kernel32 = unsafe {
+        windows::Win32::System::LibraryLoader::GetModuleHandleW(
+            windows::core::w!("kernel32.dll")
+        )
+    };
+
+    let kernel32 = match kernel32 {
+        Ok(h) => h,
+        Err(_) => return Err(EmFitError::WindowsError("Failed to get kernel32 handle".to_string())),
+    };
+
+    let proc_addr = unsafe {
+        windows::Win32::System::LibraryLoader::GetProcAddress(
+            kernel32,
+            windows::core::s!("OpenFileById")
+        )
+    };
+
+    let open_file_by_id_fn: Option<unsafe extern "system" fn(
+        HANDLE,           // hVolumeHint
+        *const FileIdDescriptor, // lpFileId
+        u32,              // dwDesiredAccess
+        u32,              // dwShareMode
+        *const std::ffi::c_void, // lpSecurityAttributes
+        u32,              // dwFlagsAndAttributes
+    ) -> HANDLE> = proc_addr.map(|p| unsafe { std::mem::transmute(p) });
+
+    let open_file_by_id_fn = match open_file_by_id_fn {
+        Some(f) => f,
+        None => return Err(EmFitError::WindowsError("OpenFileById not available".to_string())),
+    };
+
+    // Call OpenFileById
+    // dwDesiredAccess: FILE_READ_ATTRIBUTES (0x80)
+    // dwShareMode: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE (0x7)
+    // dwFlagsAndAttributes: FILE_FLAG_BACKUP_SEMANTICS (0x02000000) - needed for directories
+    let handle = unsafe {
+        open_file_by_id_fn(
+            HANDLE(volume_handle.as_raw() as *mut std::ffi::c_void),
+            &descriptor,
+            0x80,       // FILE_READ_ATTRIBUTES
+            0x7,        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            ptr::null(),
+            0x02000000, // FILE_FLAG_BACKUP_SEMANTICS
+        )
+    };
+
+    SafeHandle::new(handle.0 as isize).ok_or_else(|| {
+        let error = std::io::Error::last_os_error();
+        EmFitError::WindowsError(format!("OpenFileById failed for FRN {}: {}", file_id, error))
+    })
+}
+
+/// Get file metadata using GetFileInformationByHandle
+fn get_file_info_by_handle(handle: &SafeHandle) -> Result<FileMetadata> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+
+    let result = unsafe {
+        GetFileInformationByHandle(
+            HANDLE(handle.as_raw() as *mut std::ffi::c_void),
+            &mut info,
+        )
+    };
+
+    if result.is_err() {
+        return Err(EmFitError::WindowsError(format!(
+            "GetFileInformationByHandle failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Combine high and low parts for size
+    let file_size = ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64);
+
+    // Convert FILETIME to u64 (100-nanosecond intervals since 1601)
+    let creation_time = ((info.ftCreationTime.dwHighDateTime as u64) << 32)
+        | (info.ftCreationTime.dwLowDateTime as u64);
+    let modification_time = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | (info.ftLastWriteTime.dwLowDateTime as u64);
+    let access_time = ((info.ftLastAccessTime.dwHighDateTime as u64) << 32)
+        | (info.ftLastAccessTime.dwLowDateTime as u64);
+
+    Ok(FileMetadata {
+        file_size,
+        creation_time,
+        modification_time,
+        access_time,
+        attributes: info.dwFileAttributes,
+    })
+}
+
+/// Get file metadata by MFT record number (File Reference Number)
+///
+/// This opens the file by its FRN and queries Windows for the actual
+/// file metadata. This is more accurate than MFT data for certain files
+/// (sparse files, hardlinks, files managed by filter drivers, etc.)
+pub fn get_file_metadata_by_id(volume_handle: &SafeHandle, file_id: u64) -> Result<FileMetadata> {
+    let file_handle = open_file_by_id(volume_handle, file_id)?;
+    get_file_info_by_handle(&file_handle)
+}
+
+/// Batch retrieve file metadata for multiple files
+///
+/// This efficiently retrieves metadata for multiple files by their FRNs.
+/// Returns a HashMap of file_id -> FileMetadata for successful retrievals.
+/// Files that fail to open (deleted, inaccessible) are silently skipped.
+pub fn batch_get_file_metadata(
+    volume_handle: &SafeHandle,
+    file_ids: &[u64],
+) -> std::collections::HashMap<u64, FileMetadata> {
+    let mut results = std::collections::HashMap::with_capacity(file_ids.len());
+
+    for &file_id in file_ids {
+        // Skip system MFT records (0-15 are reserved)
+        if file_id < 16 {
+            continue;
+        }
+
+        if let Ok(metadata) = get_file_metadata_by_id(volume_handle, file_id) {
+            results.insert(file_id, metadata);
+        }
+        // Silently skip files that fail - they may be deleted or inaccessible
+    }
+
+    results
 }

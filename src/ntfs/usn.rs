@@ -18,6 +18,8 @@ use std::collections::HashMap;
 pub struct UsnEntry {
     pub record_number: u64,
     pub parent_record_number: u64,
+    /// Full file reference number including sequence number (for OpenFileById)
+    pub file_reference_number: u64,
     pub name: String,
     pub attributes: u32,
     pub is_directory: bool,
@@ -121,6 +123,7 @@ impl UsnScanner {
                     let entry = UsnEntry {
                         record_number: record.file_record_number(),
                         parent_record_number: record.parent_record_number(),
+                        file_reference_number: record.file_reference_number, // Full FRN with sequence
                         name: record.file_name.clone(),
                         attributes: record.file_attributes,
                         is_directory: (record.file_attributes & file_attributes::DIRECTORY) != 0,

@@ -5,7 +5,7 @@
 
 use crate::ntfs::{FileEntry, UsnEntry};
 use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
-use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, SafeHandle};
+use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, open_volume_for_file_id, SafeHandle};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -22,6 +22,8 @@ pub struct TreeNode {
     pub record_number: u64,
     /// Parent record number (5 = root)
     pub parent_record_number: u64,
+    /// Full file reference number including sequence (for OpenFileById)
+    pub file_reference_number: u64,
     /// File/directory name
     pub name: String,
     /// File size in bytes (0 for directories)
@@ -54,6 +56,8 @@ impl TreeNode {
         Self {
             record_number: entry.record_number,
             parent_record_number: entry.parent_record_number,
+            // FileEntry doesn't have full FRN, use record_number as fallback
+            file_reference_number: entry.record_number,
             name: entry.name.clone(),
             file_size: entry.file_size,
             allocated_size: entry.allocated_size,
@@ -74,6 +78,7 @@ impl TreeNode {
         Self {
             record_number: entry.record_number,
             parent_record_number: entry.parent_record_number,
+            file_reference_number: entry.file_reference_number,
             name: entry.name.clone(),
             file_size: 0,
             allocated_size: 0,
@@ -432,6 +437,78 @@ impl FileTree {
 
         stats.orphaned_files = self.find_orphans().len() as u64;
         self.stats = stats;
+    }
+
+    /// Refresh metadata for multiple files using Windows API
+    ///
+    /// This retrieves accurate file sizes and timestamps by opening each file
+    /// by its File Reference Number and querying Windows directly. This is more
+    /// accurate than MFT data for certain files (sparse files, hardlinks,
+    /// files managed by filter drivers, etc.)
+    ///
+    /// Takes a slice of (record_number, file_reference_number) pairs.
+    /// Returns a HashMap of record_number -> (file_size, modification_time) for successful updates.
+    pub fn refresh_metadata(&self, entries: &[(u64, u64)]) -> std::collections::HashMap<u64, (u64, u64)> {
+        use crate::ntfs::winapi::get_file_metadata_by_id;
+
+        let mut results = std::collections::HashMap::new();
+
+        // Open volume root directory handle for OpenFileById
+        let volume_handle = match open_volume_for_file_id(self.drive_letter) {
+            Ok(h) => h,
+            Err(_) => return results,
+        };
+
+        // Fetch metadata for each file using full FRN
+        for &(record_num, file_ref) in entries {
+            // Skip system MFT records (0-15 are reserved)
+            if record_num < 16 {
+                continue;
+            }
+
+            // Use the full file reference number for OpenFileById
+            match get_file_metadata_by_id(&volume_handle, file_ref) {
+                Ok(metadata) => {
+                    // Update the node in the tree
+                    if let Some(mut node) = self.nodes.get_mut(&record_num) {
+                        node.file_size = metadata.file_size;
+                        node.creation_time = metadata.creation_time;
+                        node.modification_time = metadata.modification_time;
+                        node.total_size = metadata.file_size;
+                    }
+                    results.insert(record_num, (metadata.file_size, metadata.modification_time));
+                }
+                Err(e) => {
+                    eprintln!("[metadata] Failed for record {} (FRN 0x{:016X}): {}",
+                        record_num, file_ref, e);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Refresh metadata for a single file, returning updated values
+    ///
+    /// Returns Some((file_size, modification_time)) if successful, None otherwise.
+    pub fn refresh_single_metadata(&self, record_number: u64) -> Option<(u64, u64)> {
+        use crate::ntfs::winapi::get_file_metadata_by_id;
+
+        // Get the node to retrieve its full file reference number
+        let file_ref = self.nodes.get(&record_number)?.file_reference_number;
+
+        let volume_handle = open_volume_for_file_id(self.drive_letter).ok()?;
+        let metadata = get_file_metadata_by_id(&volume_handle, file_ref).ok()?;
+
+        // Update the node in the tree
+        if let Some(mut node) = self.nodes.get_mut(&record_number) {
+            node.file_size = metadata.file_size;
+            node.creation_time = metadata.creation_time;
+            node.modification_time = metadata.modification_time;
+            node.total_size = metadata.file_size;
+        }
+
+        Some((metadata.file_size, metadata.modification_time))
     }
 }
 

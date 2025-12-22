@@ -15,6 +15,7 @@ pub enum BackgroundMessage {
     ScanError(String),
     SortComplete(SortColumn, Vec<usize>),
     SortProgress(String),
+    MetadataRefreshComplete(Vec<(usize, u64, u64)>), // (entry_index, file_size, modification_time)
 }
 
 /// A lightweight entry with cached sort keys
@@ -22,6 +23,8 @@ pub enum BackgroundMessage {
 pub struct EntryData {
     pub tree_index: usize,
     pub record_number: u64,
+    /// Full file reference number (for OpenFileById metadata refresh)
+    pub file_reference_number: u64,
     pub name_lower: String,  // Pre-lowercased for fast sorting
     pub file_size: u64,
     pub modification_time: u64,
@@ -64,6 +67,10 @@ pub struct EmFitApp {
     last_sort_column: Option<SortColumn>,
     /// Last sort order (for reverse optimization)
     last_sort_order: SortOrder,
+    /// Whether metadata refresh is in progress
+    is_refreshing_metadata: bool,
+    /// Set of entry indices that need metadata refresh (have 0 size or 0 time)
+    pending_metadata_refresh: std::collections::HashSet<usize>,
 }
 
 impl Default for EmFitApp {
@@ -89,6 +96,8 @@ impl Default for EmFitApp {
             total_count: 0,
             last_sort_column: None,
             last_sort_order: SortOrder::Ascending,
+            is_refreshing_metadata: false,
+            pending_metadata_refresh: std::collections::HashSet::new(),
         }
     }
 }
@@ -182,6 +191,7 @@ impl EmFitApp {
                                 self.all_entries.push(EntryData {
                                     tree_index,
                                     record_number: node.record_number,
+                                    file_reference_number: node.file_reference_number,
                                     name_lower: node.name.to_lowercase(),
                                     file_size: node.file_size,
                                     modification_time: node.modification_time,
@@ -228,6 +238,17 @@ impl EmFitApp {
                         self.last_sort_order = self.table.sort_order;
                         self.is_sorting = false;
                         self.status_message = format!("{} objects", self.filtered_indices.len());
+                    }
+                    BackgroundMessage::MetadataRefreshComplete(updates) => {
+                        // Apply metadata updates to cached entries
+                        for (entry_idx, file_size, modification_time) in updates {
+                            if let Some(entry) = self.all_entries.get_mut(entry_idx) {
+                                entry.file_size = file_size;
+                                entry.modification_time = modification_time;
+                            }
+                            self.pending_metadata_refresh.remove(&entry_idx);
+                        }
+                        self.is_refreshing_metadata = false;
                     }
                 }
             }
@@ -404,6 +425,89 @@ impl EmFitApp {
                 }
             }
         }
+
+        // Trigger metadata refresh for results with missing data
+        self.trigger_metadata_refresh();
+    }
+
+    /// Trigger background metadata refresh for entries with 0 size or 0 modification time
+    fn trigger_metadata_refresh(&mut self) {
+        if self.is_refreshing_metadata || self.filtered_indices.is_empty() {
+            return;
+        }
+
+        // Collect entries that need metadata refresh (0 size or 0 time for non-directories)
+        // Limit to visible results to avoid excessive API calls
+        let max_refresh = 10000; // Reasonable limit
+        // (entry_idx, tree_idx, record_num, file_reference_number)
+        let mut needs_refresh: Vec<(usize, usize, u64, u64)> = Vec::new();
+
+        for &entry_idx in self.filtered_indices.iter().take(max_refresh) {
+            if self.pending_metadata_refresh.contains(&entry_idx) {
+                continue; // Already pending
+            }
+
+            if let Some(entry) = self.all_entries.get(entry_idx) {
+                // Non-directories with 0 size or 0 modification time need refresh
+                if !entry.is_directory && (entry.file_size == 0 || entry.modification_time == 0) {
+                    needs_refresh.push((
+                        entry_idx,
+                        entry.tree_index,
+                        entry.record_number,
+                        entry.file_reference_number,
+                    ));
+                    self.pending_metadata_refresh.insert(entry_idx);
+                }
+            }
+        }
+
+        if needs_refresh.is_empty() {
+            return;
+        }
+
+        self.is_refreshing_metadata = true;
+
+        // Group by tree index for efficient batch processing
+        let trees = self.trees.clone();
+        let tx = match &self.sort_sender {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+
+        thread::spawn(move || {
+            use std::collections::HashMap;
+
+            // Group by tree index: tree_idx -> Vec<(entry_idx, record_num, file_ref)>
+            let mut by_tree: HashMap<usize, Vec<(usize, u64, u64)>> = HashMap::new();
+            for (entry_idx, tree_idx, record_num, file_ref) in needs_refresh {
+                by_tree.entry(tree_idx).or_default().push((entry_idx, record_num, file_ref));
+            }
+
+            let mut updates: Vec<(usize, u64, u64)> = Vec::new();
+
+            // Process each tree
+            for (tree_idx, entries) in by_tree {
+                if let Some(tree) = trees.get(tree_idx) {
+                    // Build pairs of (record_num, file_reference_number)
+                    let refresh_pairs: Vec<(u64, u64)> = entries
+                        .iter()
+                        .map(|(_, rn, fr)| (*rn, *fr))
+                        .collect();
+
+                    // Refresh metadata in the tree using full FRN
+                    let metadata_results = tree.refresh_metadata(&refresh_pairs);
+
+                    // Collect updated values
+                    for (entry_idx, record_num, _) in entries {
+                        if let Some(&(file_size, modification_time)) = metadata_results.get(&record_num) {
+                            updates.push((entry_idx, file_size, modification_time));
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(BackgroundMessage::MetadataRefreshComplete(updates));
+        });
     }
 
     /// Get a node by entry index
@@ -433,7 +537,7 @@ impl eframe::App for EmFitApp {
             self.render_results_table(ui);
         });
 
-        if self.is_scanning || self.is_sorting {
+        if self.is_scanning || self.is_sorting || self.is_refreshing_metadata {
             ctx.request_repaint();
         }
     }
