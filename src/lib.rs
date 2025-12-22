@@ -1,4 +1,4 @@
-//! RustyScan - High-performance NTFS file scanner
+//! EmFit - High-performance NTFS file scanner
 //!
 //! Combines the best of WizTree (direct MFT reading) and Everything (USN Journal)
 //! for ultra-fast, accurate file system scanning.
@@ -15,9 +15,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use rustyscan::{VolumeScanner, ScanConfig, SearchIndex, parse_query};
+//! use emfit::{VolumeScanner, ScanConfig, SearchIndex, parse_query};
 //!
-//! fn main() -> rustyscan::Result<()> {
+//! fn main() -> emfit::Result<()> {
 //!     // Scan C: drive
 //!     let mut scanner = VolumeScanner::new('C')
 //!         .with_config(ScanConfig::default());
@@ -54,7 +54,7 @@ pub mod ntfs;
 pub mod scanner;
 
 // Re-export main types
-pub use error::{Result, RustyScanError};
+pub use error::{Result, EmFitError};
 pub use file_tree::{FileTree, SearchResult, TreeBuilder, TreeNode, TreeStats};
 pub use scanner::{
     ChangeMonitor, MultiVolumeScanner, ScanConfig, ScanPhase, ScanProgress, VolumeScanner,

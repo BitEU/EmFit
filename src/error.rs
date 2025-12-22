@@ -1,12 +1,12 @@
-//! Error types for RustyScan
+//! Error types for EmFit
 //!
 //! Comprehensive error handling for all NTFS operations
 
 use thiserror::Error;
 
-/// Main error type for RustyScan operations
+/// Main error type for EmFit operations
 #[derive(Error, Debug)]
-pub enum RustyScanError {
+pub enum EmFitError {
     #[error("Failed to open volume '{0}': {1}")]
     VolumeOpenError(String, std::io::Error),
 
@@ -59,23 +59,23 @@ pub enum RustyScanError {
     OrphanedRecord(u64, u64),
 }
 
-/// Result type alias for RustyScan operations
-pub type Result<T> = std::result::Result<T, RustyScanError>;
+/// Result type alias for EmFit operations
+pub type Result<T> = std::result::Result<T, EmFitError>;
 
-impl RustyScanError {
+impl EmFitError {
     /// Create a Windows API error from a raw error code
     pub fn from_win32(code: u32, context: &str) -> Self {
-        RustyScanError::WindowsError(format!("{}: Win32 error code {}", context, code))
+        EmFitError::WindowsError(format!("{}: Win32 error code {}", context, code))
     }
 
     /// Check if this error is recoverable (scan can continue)
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            RustyScanError::InvalidMftRecord(_, _)
-                | RustyScanError::FixupVerificationFailed(_)
-                | RustyScanError::InvalidAttribute(_, _)
-                | RustyScanError::OrphanedRecord(_, _)
+            EmFitError::InvalidMftRecord(_, _)
+                | EmFitError::FixupVerificationFailed(_)
+                | EmFitError::InvalidAttribute(_, _)
+                | EmFitError::OrphanedRecord(_, _)
         )
     }
 }

@@ -3,7 +3,7 @@
 //! Handles reading and parsing MFT records with fixup verification,
 //! attribute extraction, and data run decoding.
 
-use crate::error::{Result, RustyScanError};
+use crate::error::{Result, EmFitError};
 use crate::ntfs::structs::*;
 use crate::ntfs::winapi::*;
 use std::collections::{HashMap, HashSet};
@@ -250,7 +250,7 @@ impl MftParser {
         let bytes_read = read_volume_at(&self.handle, offset, &mut buffer)?;
 
         if bytes_read < record_size {
-            return Err(RustyScanError::MftReadError(format!(
+            return Err(EmFitError::MftReadError(format!(
                 "Short read for record {}: got {} bytes, expected {}",
                 record_number, bytes_read, record_size
             )));
@@ -289,11 +289,11 @@ impl MftParser {
     pub fn parse_record(&self, record_number: u64, data: &mut [u8]) -> Result<FileEntry> {
         // Verify signature
         let header = MftRecordHeader::from_bytes(data).ok_or_else(|| {
-            RustyScanError::InvalidMftRecord(record_number, "Failed to parse header".to_string())
+            EmFitError::InvalidMftRecord(record_number, "Failed to parse header".to_string())
         })?;
 
         if !header.is_valid() {
-            return Err(RustyScanError::InvalidMftRecord(
+            return Err(EmFitError::InvalidMftRecord(
                 record_number,
                 "Invalid signature".to_string(),
             ));
@@ -454,7 +454,7 @@ impl MftParser {
         let update_seq_count = header.update_sequence_size as usize;
 
         if update_seq_offset + 2 > data.len() {
-            return Err(RustyScanError::FixupVerificationFailed(record_number));
+            return Err(EmFitError::FixupVerificationFailed(record_number));
         }
 
         // Read sequence number (first value in update sequence array)
@@ -472,7 +472,7 @@ impl MftParser {
             // Verify sequence number at end of sector
             let stored_seq = u16::from_le_bytes([data[sector_end], data[sector_end + 1]]);
             if stored_seq != seq_number {
-                return Err(RustyScanError::FixupVerificationFailed(record_number));
+                return Err(EmFitError::FixupVerificationFailed(record_number));
             }
 
             // Restore original bytes from fixup array
@@ -501,7 +501,7 @@ impl MftParser {
 
         while offset + 16 <= record_size && offset + 16 <= data.len() {
             let attr_header = AttributeHeader::from_bytes(&data[offset..]).ok_or_else(|| {
-                RustyScanError::InvalidAttribute(offset as u32, "Failed to parse header".to_string())
+                EmFitError::InvalidAttribute(offset as u32, "Failed to parse header".to_string())
             })?;
 
             // End of attributes
@@ -581,7 +581,7 @@ impl MftParser {
     ) -> Result<Option<Vec<u64>>> {
         // Get the attribute list content
         let attr_header = AttributeHeader::from_bytes(attr_data).ok_or_else(|| {
-            RustyScanError::InvalidAttribute(0, "Failed to parse attr list header".to_string())
+            EmFitError::InvalidAttribute(0, "Failed to parse attr list header".to_string())
         })?;
 
         let list_data = if attr_header.non_resident {
@@ -591,7 +591,7 @@ impl MftParser {
         } else {
             // Resident - get the content directly
             let res_header = ResidentAttributeHeader::from_bytes(attr_data).ok_or_else(|| {
-                RustyScanError::InvalidAttribute(0, "Failed to parse resident header".to_string())
+                EmFitError::InvalidAttribute(0, "Failed to parse resident header".to_string())
             })?;
 
             let content_offset = res_header.value_offset as usize;
@@ -1028,7 +1028,7 @@ fn apply_fixup_standalone(data: &mut [u8], header: &MftRecordHeader) -> Result<(
     let fixup_count = header.update_sequence_size as usize;
 
     if fixup_count < 2 || fixup_offset + fixup_count * 2 > data.len() {
-        return Err(RustyScanError::InvalidMftRecord(0, "Invalid fixup".to_string()));
+        return Err(EmFitError::InvalidMftRecord(0, "Invalid fixup".to_string()));
     }
 
     // First 2 bytes of fixup array is the check value
@@ -1047,7 +1047,7 @@ fn apply_fixup_standalone(data: &mut [u8], header: &MftRecordHeader) -> Result<(
         // Verify the sector ends with the check value
         let sector_value = u16::from_le_bytes([data[sector_end], data[sector_end + 1]]);
         if sector_value != check_value {
-            return Err(RustyScanError::InvalidMftRecord(0, "Fixup mismatch".to_string()));
+            return Err(EmFitError::InvalidMftRecord(0, "Fixup mismatch".to_string()));
         }
 
         // Replace with original bytes from fixup array

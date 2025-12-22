@@ -2,7 +2,7 @@
 //!
 //! Safe wrappers around Win32 APIs for volume access and IOCTL operations.
 
-use crate::error::{Result, RustyScanError};
+use crate::error::{Result, EmFitError};
 use crate::ntfs::structs::*;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -117,8 +117,8 @@ pub fn open_volume_path(path: &str) -> Result<SafeHandle> {
 
     match handle {
         Ok(h) => SafeHandle::new(h.0 as isize)
-            .ok_or_else(|| RustyScanError::VolumeOpenError(path.to_string(), std::io::Error::last_os_error())),
-        Err(e) => Err(RustyScanError::VolumeOpenError(path.to_string(), std::io::Error::from_raw_os_error(e.code().0 as i32))),
+            .ok_or_else(|| EmFitError::VolumeOpenError(path.to_string(), std::io::Error::last_os_error())),
+        Err(e) => Err(EmFitError::VolumeOpenError(path.to_string(), std::io::Error::from_raw_os_error(e.code().0 as i32))),
     }
 }
 
@@ -149,8 +149,8 @@ pub fn open_file_read(path: &str) -> Result<SafeHandle> {
 
     match handle {
         Ok(h) => SafeHandle::new(h.0 as isize)
-            .ok_or_else(|| RustyScanError::IoError(std::io::Error::last_os_error())),
-        Err(e) => Err(RustyScanError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))),
+            .ok_or_else(|| EmFitError::IoError(std::io::Error::last_os_error())),
+        Err(e) => Err(EmFitError::IoError(std::io::Error::from_raw_os_error(e.code().0 as i32))),
     }
 }
 
@@ -192,7 +192,7 @@ pub fn device_io_control(
         Ok(bytes_returned)
     } else {
         let error = std::io::Error::last_os_error();
-        Err(RustyScanError::WindowsError(format!(
+        Err(EmFitError::WindowsError(format!(
             "DeviceIoControl(0x{:08X}) failed: {}",
             control_code, error
         )))
@@ -205,7 +205,7 @@ pub fn get_ntfs_volume_data(handle: &SafeHandle) -> Result<NtfsVolumeData> {
     device_io_control(handle, FSCTL_GET_NTFS_VOLUME_DATA, None, &mut buffer)?;
 
     NtfsVolumeData::from_bytes(&buffer).ok_or_else(|| {
-        RustyScanError::VolumeDataError("Failed to parse NTFS volume data".to_string())
+        EmFitError::VolumeDataError("Failed to parse NTFS volume data".to_string())
     })
 }
 
@@ -233,7 +233,7 @@ pub fn get_ntfs_file_record(
     )?;
 
     if bytes_returned < 12 {
-        return Err(RustyScanError::MftReadError(format!(
+        return Err(EmFitError::MftReadError(format!(
             "Short response for record {}: {} bytes",
             record_number, bytes_returned
         )));
@@ -245,7 +245,7 @@ pub fn get_ntfs_file_record(
     let returned_record = returned_frn & 0x0000_FFFF_FFFF_FFFF; // Lower 48 bits
 
     if returned_record != record_number {
-        return Err(RustyScanError::MftReadError(format!(
+        return Err(EmFitError::MftReadError(format!(
             "Record {} not in use (returned {})",
             record_number, returned_record
         )));
@@ -254,7 +254,7 @@ pub fn get_ntfs_file_record(
     let record_length = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
 
     if record_length == 0 || 12 + record_length > buffer.len() {
-        return Err(RustyScanError::MftReadError(format!(
+        return Err(EmFitError::MftReadError(format!(
             "Invalid record length {} for record {}",
             record_length, record_number
         )));
@@ -269,13 +269,13 @@ pub fn query_usn_journal(handle: &SafeHandle) -> Result<UsnJournalData> {
 
     match device_io_control(handle, FSCTL_QUERY_USN_JOURNAL, None, &mut buffer) {
         Ok(_) => UsnJournalData::from_bytes(&buffer).ok_or_else(|| {
-            RustyScanError::UsnJournalError("Failed to parse USN journal data".to_string())
+            EmFitError::UsnJournalError("Failed to parse USN journal data".to_string())
         }),
         Err(e) => {
             // Check for "journal not active" error
             let error_str = e.to_string();
             if error_str.contains("1178") || error_str.contains("1179") {
-                Err(RustyScanError::UsnJournalNotActive("Volume".to_string()))
+                Err(EmFitError::UsnJournalNotActive("Volume".to_string()))
             } else {
                 Err(e)
             }
@@ -300,7 +300,7 @@ pub fn read_volume_at(handle: &SafeHandle, offset: u64, buffer: &mut [u8]) -> Re
     };
 
     if seek_result.is_err() {
-        return Err(RustyScanError::IoError(std::io::Error::last_os_error()));
+        return Err(EmFitError::IoError(std::io::Error::last_os_error()));
     }
 
     // Read data
@@ -317,7 +317,7 @@ pub fn read_volume_at(handle: &SafeHandle, offset: u64, buffer: &mut [u8]) -> Re
     if read_result.is_ok() {
         Ok(bytes_read as usize)
     } else {
-        Err(RustyScanError::IoError(std::io::Error::last_os_error()))
+        Err(EmFitError::IoError(std::io::Error::last_os_error()))
     }
 }
 
@@ -396,7 +396,7 @@ pub fn enum_usn_data(
             return Ok((0, 0));
         }
 
-        return Err(RustyScanError::WindowsError(format!(
+        return Err(EmFitError::WindowsError(format!(
             "DeviceIoControl(0x{:08X}) failed: {}",
             FSCTL_ENUM_USN_DATA, error
         )));

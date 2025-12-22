@@ -1,9 +1,9 @@
 [package]
-name = "rustyscan"
+name = "emfit"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance NTFS file scanner combining the best of WizTree and Everything"
-authors = ["RustyScan Contributors"]
+authors = ["EmFit Contributors"]
 
 [dependencies]
 windows = { version = "0.58", features = [
@@ -36,5 +36,5 @@ codegen-units = 1
 panic = "abort"
 
 [[bin]]
-name = "rustyscan"
+name = "emfit"
 path = "src/main.rs"

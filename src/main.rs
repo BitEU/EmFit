@@ -1,25 +1,25 @@
-//! RustyScan CLI
+//! EmFit CLI
 //!
-//! Command-line interface for the RustyScan file scanner.
+//! Command-line interface for the EmFit file scanner.
 //! Provides both command-line and interactive search modes.
 
 use clap::{Parser, Subcommand};
 use console::{style, Term};
 use indicatif::HumanDuration;
-use rustyscan::{
+use emfit::{
     format_size, FileTree,
     MultiVolumeScanner, ScanConfig, VolumeScanner,
 };
 use std::io::Write;
 use std::time::Instant;
 
-/// RustyScan - Ultra-fast NTFS file scanner
+/// EmFit - Ultra-fast NTFS file scanner
 ///
 /// Combines USN Journal enumeration with direct MFT reading
 /// for instant, accurate file system scanning.
 #[derive(Parser)]
-#[command(name = "rustyscan")]
-#[command(author = "RustyScan Contributors")]
+#[command(name = "emfit")]
+#[command(author = "EmFit Contributors")]
 #[command(version)]
 #[command(about = "Ultra-fast NTFS file scanner", long_about = None)]
 struct Cli {
@@ -205,7 +205,7 @@ fn cmd_scan(
     include_hidden: bool,
     include_system: bool,
     output_format: &str,
-) -> rustyscan::Result<()> {
+) -> emfit::Result<()> {
     let term = Term::stdout();
     let start = Instant::now();
 
@@ -289,7 +289,7 @@ fn cmd_scan(
 }
 
 /// Search command implementation
-fn cmd_search(drive: char, pattern: &str, max_results: usize) -> rustyscan::Result<()> {
+fn cmd_search(drive: char, pattern: &str, max_results: usize) -> emfit::Result<()> {
     println!(
         "{} Searching for '{}' on {}:",
         style("→").cyan().bold(),
@@ -342,7 +342,7 @@ fn cmd_search(drive: char, pattern: &str, max_results: usize) -> rustyscan::Resu
 }
 
 /// Largest files/directories command
-fn cmd_largest(drive: char, count: usize, show_dirs: bool) -> rustyscan::Result<()> {
+fn cmd_largest(drive: char, count: usize, show_dirs: bool) -> emfit::Result<()> {
     let item_type = if show_dirs { "directories" } else { "files" };
     println!(
         "{} Finding {} largest {} on {}:",
@@ -388,7 +388,7 @@ fn cmd_largest(drive: char, count: usize, show_dirs: bool) -> rustyscan::Result<
 }
 
 /// Tree size analysis command
-fn cmd_tree_size(drive: char, path: Option<&str>, depth: usize) -> rustyscan::Result<()> {
+fn cmd_tree_size(drive: char, path: Option<&str>, depth: usize) -> emfit::Result<()> {
     println!(
         "{} Analyzing disk space on {}:",
         style("→").cyan().bold(),
@@ -423,7 +423,7 @@ fn cmd_tree_size(drive: char, path: Option<&str>, depth: usize) -> rustyscan::Re
     Ok(())
 }
 
-fn print_tree_node(tree: &FileTree, node: &rustyscan::TreeNode, indent: usize, max_depth: usize) {
+fn print_tree_node(tree: &FileTree, node: &emfit::TreeNode, indent: usize, max_depth: usize) {
     if indent > max_depth {
         return;
     }
@@ -453,7 +453,7 @@ fn print_tree_node(tree: &FileTree, node: &rustyscan::TreeNode, indent: usize, m
 }
 
 /// List volumes command
-fn cmd_volumes() -> rustyscan::Result<()> {
+fn cmd_volumes() -> emfit::Result<()> {
     println!("{} Detecting NTFS volumes...", style("→").cyan().bold());
     println!();
 
@@ -468,8 +468,8 @@ fn cmd_volumes() -> rustyscan::Result<()> {
             print!("  {} {}:", style("•").green(), letter);
 
             // Try to get volume info
-            if let Ok(handle) = rustyscan::ntfs::open_volume(letter) {
-                if let Ok(data) = rustyscan::ntfs::winapi::get_ntfs_volume_data(&handle) {
+            if let Ok(handle) = emfit::ntfs::open_volume(letter) {
+                if let Ok(data) = emfit::ntfs::winapi::get_ntfs_volume_data(&handle) {
                     let total = data.total_clusters * data.bytes_per_cluster as u64;
                     let free = data.free_clusters * data.bytes_per_cluster as u64;
                     println!(
@@ -490,8 +490,8 @@ fn cmd_volumes() -> rustyscan::Result<()> {
 }
 
 /// Monitor command
-fn cmd_monitor(drive: char) -> rustyscan::Result<()> {
-    use rustyscan::ChangeMonitor;
+fn cmd_monitor(drive: char) -> emfit::Result<()> {
+    use emfit::ChangeMonitor;
 
     println!(
         "{} Monitoring file system changes on {}:",
@@ -519,7 +519,7 @@ fn cmd_monitor(drive: char) -> rustyscan::Result<()> {
 }
 
 /// Export command
-fn cmd_export(drive: char, output: &str, format: &str) -> rustyscan::Result<()> {
+fn cmd_export(drive: char, output: &str, format: &str) -> emfit::Result<()> {
     println!(
         "{} Exporting scan results to {}",
         style("→").cyan().bold(),
@@ -598,7 +598,7 @@ fn cmd_export(drive: char, output: &str, format: &str) -> rustyscan::Result<()> 
 }
 
 /// Debug command - trace parent chain for a file
-fn cmd_debug(drive: char, pattern: &str) -> rustyscan::Result<()> {
+fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
     println!(
         "{} Debug: tracing parent chain for '{}' on {}:",
         style("→").cyan().bold(),
@@ -734,9 +734,9 @@ fn cmd_debug(drive: char, pattern: &str) -> rustyscan::Result<()> {
 }
 
 /// Read a specific MFT record directly
-fn cmd_read_mft(drive: char, record_num: u64) -> rustyscan::Result<()> {
-    use rustyscan::ntfs::{open_volume, MftParser};
-    use rustyscan::ntfs::winapi::get_ntfs_volume_data;
+fn cmd_read_mft(drive: char, record_num: u64) -> emfit::Result<()> {
+    use emfit::ntfs::{open_volume, MftParser};
+    use emfit::ntfs::winapi::get_ntfs_volume_data;
 
     println!(
         "{} Reading MFT record {} from {}:",
@@ -837,8 +837,8 @@ fn cmd_read_mft(drive: char, record_num: u64) -> rustyscan::Result<()> {
 }
 
 /// Debug: count raw USN enumeration results
-fn cmd_usn_count(drive: char) -> rustyscan::Result<()> {
-    use rustyscan::ntfs::{open_volume, UsnScanner};
+fn cmd_usn_count(drive: char) -> emfit::Result<()> {
+    use emfit::ntfs::{open_volume, UsnScanner};
 
     println!(
         "{} Counting raw USN enumeration for {}:",

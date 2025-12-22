@@ -3,7 +3,7 @@
 //! Fast file enumeration using the NTFS USN (Update Sequence Number) Journal.
 //! This is the method used by Everything for instant file indexing.
 
-use crate::error::{Result, RustyScanError};
+use crate::error::{Result, EmFitError};
 use crate::ntfs::mft::FileEntry;
 use crate::ntfs::structs::*;
 use crate::ntfs::winapi::*;
@@ -86,7 +86,7 @@ impl UsnScanner {
         let journal = self
             .journal_data
             .as_ref()
-            .ok_or_else(|| RustyScanError::UsnJournalError("Journal not initialized".to_string()))?;
+            .ok_or_else(|| EmFitError::UsnJournalError("Journal not initialized".to_string()))?;
 
         let high_usn = journal.next_usn as i64;
         let mut start_frn: u64 = 0;
@@ -357,7 +357,7 @@ impl HybridScanner {
             usn.enumerate_to_map()
         } else {
             // Would need MFT parser here - for now return error
-            Err(RustyScanError::UsnJournalNotActive(
+            Err(EmFitError::UsnJournalNotActive(
                 self.drive_letter.to_string(),
             ))
         }

@@ -3,7 +3,7 @@
 //! Orchestrates the scanning process, combining USN enumeration
 //! with MFT parsing for complete and accurate results.
 
-use crate::error::{Result, RustyScanError};
+use crate::error::{Result, EmFitError};
 use crate::file_tree::{FileTree, TreeBuilder, TreeNode};
 use crate::ntfs::{
     open_volume, FileEntry, MftParser, NtfsVolumeData, UsnEntry, UsnMonitor, UsnScanner,
@@ -202,7 +202,7 @@ impl VolumeScanner {
         }
 
         if self.is_cancelled() {
-            return Err(RustyScanError::Cancelled);
+            return Err(EmFitError::Cancelled);
         }
 
         // Phase 3: MFT reading for size information (or full scan if USN failed)
@@ -220,7 +220,7 @@ impl VolumeScanner {
         }
 
         if self.is_cancelled() {
-            return Err(RustyScanError::Cancelled);
+            return Err(EmFitError::Cancelled);
         }
 
         // Phase 4: Build and finalize tree
@@ -304,7 +304,7 @@ impl VolumeScanner {
 
         while processed < total_records {
             if self.is_cancelled() {
-                return Err(RustyScanError::Cancelled);
+                return Err(EmFitError::Cancelled);
             }
 
             let batch_count = std::cmp::min(batch_size, (total_records - processed) as usize);
@@ -434,7 +434,7 @@ impl ChangeMonitor {
 
         let journal = scanner
             .journal_data()
-            .ok_or_else(|| RustyScanError::UsnJournalNotActive(drive_letter.to_string()))?;
+            .ok_or_else(|| EmFitError::UsnJournalNotActive(drive_letter.to_string()))?;
 
         // Need to reopen handle for monitor (scanner took ownership)
         let handle = open_volume(drive_letter)?;
@@ -451,7 +451,7 @@ impl ChangeMonitor {
         let monitor = self
             .monitor
             .as_mut()
-            .ok_or_else(|| RustyScanError::UsnJournalNotActive(self.drive_letter.to_string()))?;
+            .ok_or_else(|| EmFitError::UsnJournalNotActive(self.drive_letter.to_string()))?;
 
         let changes = monitor.poll_changes()?;
         let count = changes.len();
