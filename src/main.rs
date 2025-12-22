@@ -440,7 +440,7 @@ fn print_tree_node(tree: &FileTree, node: &emfit::TreeNode, indent: usize, max_d
         );
 
         // Get children sorted by size
-        let mut children = tree.get_children(node.record_number);
+        let mut children = tree.get_children(&node.key());
         children.sort_by(|a, b| b.total_size.cmp(&a.total_size));
 
         // Show top children
@@ -717,18 +717,18 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
         println!("  Record 253045 NOT FOUND in tree");
         // Check children of $Recycle.Bin (record 36)
         println!("\n  Children of $Recycle.Bin (record 36):");
-        if let Some(_recycle_bin) = tree.get(36) {
-            let children = tree.get_children(36);
-            if children.is_empty() {
-                println!("    No children found!");
-            } else {
-                for child in children.iter().take(20) {
-                    println!("    - Record {}: '{}' (parent: {})",
-                        child.record_number, child.name, child.parent_record_number);
-                }
-            }
-        }
-    }
+        if let Some(recycle_bin) = tree.get(36) {
+            let children = tree.get_children(&recycle_bin.key());
+             if children.is_empty() {
+                 println!("    No children found!");
+             } else {
+                 for child in children.iter().take(20) {
+                     println!("    - Record {}: '{}' (parent: {})",
+                         child.record_number, child.name, child.parent_record_number);
+                 }
+             }
+         }
+     }
 
     // Test OpenFileById for matching files
     println!("\n=== OpenFileById Test ===");
@@ -740,7 +740,7 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
             println!("    MFT data: size={}, mod_time={}", node.file_size, node.modification_time);
 
             // Try to get metadata via OpenFileById
-            match tree.refresh_single_metadata(node.record_number) {
+            match tree.refresh_single_metadata(&node.key()) {
                 Some((size, mod_time)) => {
                     println!("    OpenFileById: size={}, mod_time={}", size, mod_time);
                 }

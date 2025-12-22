@@ -56,7 +56,7 @@ pub mod scanner;
 
 // Re-export main types
 pub use error::{Result, EmFitError};
-pub use file_tree::{FileTree, SearchResult, TreeBuilder, TreeNode, TreeStats};
+pub use file_tree::{FileTree, NodeKey, SearchResult, TreeBuilder, TreeNode, TreeStats};
 pub use scanner::{
     ChangeMonitor, MultiVolumeScanner, ScanConfig, ScanPhase, ScanProgress, VolumeScanner,
 };

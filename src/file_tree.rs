@@ -2,6 +2,13 @@
 //!
 //! Builds and manages the hierarchical file tree from MFT/USN data.
 //! Supports path resolution, size aggregation, and efficient traversal.
+//!
+//! # Hard Link Support
+//!
+//! NTFS supports hard links - multiple directory entries pointing to the same file.
+//! Each hard link has a different parent directory but shares the same MFT record.
+//! To properly handle this, we use a composite key `NodeKey(record_number, parent_record_number)`
+//! which allows multiple entries for the same file with different parents.
 
 use crate::ntfs::{FileEntry, UsnEntry};
 use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
@@ -12,13 +19,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
+// Node Key - Composite key for hard link support
+// ============================================================================
+
+/// Composite key for tree nodes: (record_number, parent_record_number)
+///
+/// This allows multiple entries for the same MFT record with different parents,
+/// which is necessary for proper hard link support. Each hard link appears as
+/// a separate entry in the file tree with its own parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct NodeKey {
+    /// MFT record number
+    pub record_number: u64,
+    /// Parent directory record number
+    pub parent_record_number: u64,
+}
+
+impl NodeKey {
+    pub fn new(record_number: u64, parent_record_number: u64) -> Self {
+        Self { record_number, parent_record_number }
+    }
+
+    /// Create key for root node (record 5, parent 5)
+    pub fn root() -> Self {
+        Self { record_number: 5, parent_record_number: 5 }
+    }
+}
+
+// ============================================================================
 // Tree Node
 // ============================================================================
 
 /// A node in the file tree (file or directory)
 #[derive(Debug, Clone, Default)]
 pub struct TreeNode {
-    /// MFT record number (unique identifier)
+    /// MFT record number
     pub record_number: u64,
     /// Parent record number (5 = root)
     pub parent_record_number: u64,
@@ -38,8 +73,8 @@ pub struct TreeNode {
     pub creation_time: u64,
     /// Modification time (FILETIME)
     pub modification_time: u64,
-    /// Children (for directories) - record numbers
-    pub children: Vec<u64>,
+    /// Children (for directories) - NodeKeys of children
+    pub children: Vec<NodeKey>,
     /// Aggregated size (self + all descendants)
     pub total_size: u64,
     /// Aggregated allocated size
@@ -103,6 +138,33 @@ impl TreeNode {
         self.creation_time = entry.creation_time;
         self.modification_time = entry.modification_time;
     }
+
+    /// Get the NodeKey for this node
+    #[inline]
+    pub fn key(&self) -> NodeKey {
+        NodeKey::new(self.record_number, self.parent_record_number)
+    }
+
+    /// Create a TreeNode for a hard link (same file, different parent)
+    pub fn from_hard_link(entry: &FileEntry, link: &crate::ntfs::HardLink) -> Self {
+        Self {
+            record_number: entry.record_number,
+            parent_record_number: link.parent_record_number,
+            file_reference_number: entry.record_number,
+            name: link.name.clone(),
+            file_size: entry.file_size,
+            allocated_size: entry.allocated_size,
+            attributes: entry.attributes,
+            is_directory: entry.is_directory,
+            creation_time: entry.creation_time,
+            modification_time: entry.modification_time,
+            children: Vec::new(),
+            total_size: entry.file_size,
+            total_allocated: entry.allocated_size,
+            file_count: if entry.is_directory { 0 } else { 1 },
+            dir_count: if entry.is_directory { 1 } else { 0 },
+        }
+    }
 }
 
 // ============================================================================
@@ -113,8 +175,12 @@ impl TreeNode {
 pub struct FileTree {
     /// Drive letter
     pub drive_letter: char,
-    /// All nodes indexed by record number
-    nodes: DashMap<u64, TreeNode>,
+    /// All nodes indexed by NodeKey (record_number, parent_record_number)
+    /// This composite key allows multiple entries for the same file (hard links)
+    pub(crate) nodes: DashMap<NodeKey, TreeNode>,
+    /// Secondary index: record_number -> Vec<NodeKey>
+    /// Allows quick lookup of all hard links for a given record
+    record_index: DashMap<u64, Vec<NodeKey>>,
     /// Root record number (typically 5)
     root_record: u64,
     /// Statistics
@@ -140,6 +206,7 @@ impl FileTree {
         Self {
             drive_letter,
             nodes: DashMap::new(),
+            record_index: DashMap::new(),
             root_record: 5, // NTFS root is always record 5
             stats: TreeStats::default(),
             bytes_per_record: 1024, // Default MFT record size
@@ -151,6 +218,7 @@ impl FileTree {
         Self {
             drive_letter,
             nodes: DashMap::new(),
+            record_index: DashMap::new(),
             root_record: 5,
             stats: TreeStats::default(),
             bytes_per_record,
@@ -167,15 +235,28 @@ impl FileTree {
         let is_dir = node.is_directory;
         let size = node.file_size;
         let allocated = node.allocated_size;
-        let record_num = node.record_number;
-        let parent = node.parent_record_number;
+        let key = node.key();
+        let parent_key = NodeKey::new(key.parent_record_number, 0); // Parent's key needs lookup
 
-        self.nodes.insert(record_num, node);
+        // Insert into main map
+        self.nodes.insert(key, node);
 
-        // Update parent's children list
-        if let Some(mut parent_node) = self.nodes.get_mut(&parent) {
-            if !parent_node.children.contains(&record_num) {
-                parent_node.children.push(record_num);
+        // Update secondary index
+        self.record_index
+            .entry(key.record_number)
+            .or_insert_with(Vec::new)
+            .push(key);
+
+        // Update parent's children list (find parent by record_number)
+        // We look up any node with the parent's record number
+        if let Some(parent_keys) = self.record_index.get(&key.parent_record_number) {
+            for parent_key in parent_keys.iter() {
+                if let Some(mut parent_node) = self.nodes.get_mut(parent_key) {
+                    if !parent_node.children.contains(&key) {
+                        parent_node.children.push(key);
+                    }
+                    break; // Only need to add to one parent
+                }
             }
         }
 
@@ -187,17 +268,39 @@ impl FileTree {
         }
     }
 
-    /// Get a node by record number
+    /// Get a node by NodeKey
+    pub fn get_by_key(&self, key: &NodeKey) -> Option<TreeNode> {
+        self.nodes.get(key).map(|r| r.clone())
+    }
+
+    /// Get the first node for a record number (any parent)
+    /// Used when you don't care which hard link you get
     pub fn get(&self, record_number: u64) -> Option<TreeNode> {
-        self.nodes.get(&record_number).map(|r| r.clone())
+        if let Some(keys) = self.record_index.get(&record_number) {
+            if let Some(first_key) = keys.first() {
+                return self.nodes.get(first_key).map(|r| r.clone());
+            }
+        }
+        None
+    }
+
+    /// Get all nodes for a record number (all hard links)
+    pub fn get_all(&self, record_number: u64) -> Vec<TreeNode> {
+        if let Some(keys) = self.record_index.get(&record_number) {
+            keys.iter()
+                .filter_map(|key| self.nodes.get(key).map(|r| r.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Get children of a directory
-    pub fn get_children(&self, record_number: u64) -> Vec<TreeNode> {
-        if let Some(node) = self.nodes.get(&record_number) {
+    pub fn get_children(&self, key: &NodeKey) -> Vec<TreeNode> {
+        if let Some(node) = self.nodes.get(key) {
             node.children
                 .iter()
-                .filter_map(|&child_id| self.get(child_id))
+                .filter_map(|child_key| self.get_by_key(child_key))
                 .collect()
         } else {
             Vec::new()
@@ -206,21 +309,148 @@ impl FileTree {
 
     /// Get the root node
     pub fn root(&self) -> Option<TreeNode> {
-        self.get(self.root_record)
+        // Root has record 5 and parent 5
+        self.get_by_key(&NodeKey::root())
     }
 
-    /// Build full path for a record
+    /// Build full path for a NodeKey
     ///
     /// This method walks up the parent chain to construct the full path.
     /// If a parent is missing from the tree, it will attempt to fetch it
     /// on-demand using FSCTL_GET_NTFS_FILE_RECORD and cache it for future use.
+    pub fn build_path_for_key(&self, key: &NodeKey) -> String {
+        self.build_path_internal_key(key, false)
+    }
+
+    /// Build full path for a record number (uses first available hard link)
     pub fn build_path(&self, record_number: u64) -> String {
+        if let Some(keys) = self.record_index.get(&record_number) {
+            if let Some(first_key) = keys.first() {
+                return self.build_path_for_key(first_key);
+            }
+        }
+        // Fallback: try to build path walking up by record number only
         self.build_path_internal(record_number, false)
     }
 
     /// Build path with optional debug output
     pub fn build_path_debug(&self, record_number: u64) -> String {
         self.build_path_internal(record_number, true)
+    }
+
+    /// Build path for a NodeKey with optional debug output
+    fn build_path_internal_key(&self, start_key: &NodeKey, debug: bool) -> String {
+        let mut parts = Vec::new();
+
+        // First, get the starting node's name
+        if let Some(node) = self.nodes.get(start_key) {
+            if debug {
+                eprintln!("  [path] Start: Record {} '{}' -> parent {}",
+                    start_key.record_number, node.name, node.parent_record_number);
+            }
+            parts.push(node.name.clone());
+
+            // Now walk up the parent chain
+            let mut current_parent = node.parent_record_number;
+            self.walk_parent_chain(&mut parts, current_parent, debug);
+        }
+
+        parts.reverse();
+        format!("{}:\\{}", self.drive_letter, parts.join("\\"))
+    }
+
+    /// Walk up the parent chain collecting path components
+    fn walk_parent_chain(&self, parts: &mut Vec<String>, start_parent: u64, debug: bool) {
+        let mut current = start_parent;
+        let mut volume_handle: Option<SafeHandle> = None;
+
+        while current != self.root_record && current != 0 {
+            // Find any node with this record number (directories have only one entry)
+            if let Some(node) = self.get(current) {
+                if debug {
+                    eprintln!("  [path] Record {} '{}' -> parent {}",
+                        current, node.name, node.parent_record_number);
+                }
+                parts.push(node.name.clone());
+                current = node.parent_record_number;
+            } else {
+                if debug {
+                    eprintln!("  [path] Record {} NOT in tree, attempting fetch...", current);
+                }
+                // Parent not in tree - try to fetch it on-demand
+                if volume_handle.is_none() {
+                    match open_volume(self.drive_letter) {
+                        Ok(h) => {
+                            if debug {
+                                eprintln!("  [path] Opened volume {}:", self.drive_letter);
+                            }
+                            volume_handle = Some(h);
+                        }
+                        Err(e) => {
+                            if debug {
+                                eprintln!("  [path] Failed to open volume: {}", e);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(ref handle) = volume_handle {
+                    if debug {
+                        eprintln!("  [path] Calling get_ntfs_file_record({}, bytes={})",
+                            current, self.bytes_per_record);
+                    }
+                    match get_ntfs_file_record(handle, current, self.bytes_per_record) {
+                        Ok(data) => {
+                            if debug {
+                                eprintln!("  [path] Got {} bytes of MFT data", data.len());
+                                if data.len() >= 4 {
+                                    eprintln!("  [path] Signature: {:02X} {:02X} {:02X} {:02X}",
+                                        data[0], data[1], data[2], data[3]);
+                                }
+                            }
+                            let parse_result = if debug {
+                                extract_parent_info_debug(&data)
+                            } else {
+                                extract_parent_info(&data)
+                            };
+                            match parse_result {
+                                Some((name, parent)) => {
+                                    if debug {
+                                        eprintln!("  [path] Extracted: name='{}', parent={}", name, parent);
+                                    }
+                                    // Cache this record for future lookups
+                                    let node = TreeNode {
+                                        record_number: current,
+                                        parent_record_number: parent,
+                                        name: name.clone(),
+                                        is_directory: true,
+                                        ..Default::default()
+                                    };
+                                    self.insert(node);
+
+                                    parts.push(name);
+                                    current = parent;
+                                    continue;
+                                }
+                                None => {
+                                    if debug {
+                                        eprintln!("  [path] extract_parent_info returned None");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if debug {
+                                eprintln!("  [path] get_ntfs_file_record failed: {}", e);
+                            }
+                        }
+                    }
+                }
+                // Failed to fetch parent - stop here
+                break;
+            }
+        }
     }
 
     fn build_path_internal(&self, record_number: u64, debug: bool) -> String {
@@ -231,7 +461,7 @@ impl FileTree {
         let mut volume_handle: Option<SafeHandle> = None;
 
         while current != self.root_record && current != 0 {
-            if let Some(node) = self.nodes.get(&current) {
+            if let Some(node) = self.get(current) {
                 if debug {
                     eprintln!("  [path] Record {} '{}' -> parent {}", current, node.name, node.parent_record_number);
                 }
@@ -290,7 +520,7 @@ impl FileTree {
                                         is_directory: true,
                                         ..Default::default()
                                     };
-                                    self.nodes.insert(current, node);
+                                    self.insert(node);
 
                                     parts.push(name);
                                     current = parent;
@@ -323,63 +553,64 @@ impl FileTree {
     /// Uses iterative post-order traversal to avoid stack overflow
     pub fn calculate_sizes(&self) {
         use std::collections::HashMap;
-        
+
         // We need to process children before parents (post-order)
         // Use iterative approach with explicit stack to avoid stack overflow
-        
+
         // First pass: collect all nodes and their children in topological order
-        let mut to_visit = vec![self.root_record];
+        let root_key = NodeKey::root();
+        let mut to_visit = vec![root_key];
         let mut visit_order = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        
-        while let Some(record) = to_visit.pop() {
-            if visited.contains(&record) {
+
+        while let Some(key) = to_visit.pop() {
+            if visited.contains(&key) {
                 continue;
             }
-            visited.insert(record);
-            visit_order.push(record);
-            
-            if let Some(node) = self.nodes.get(&record) {
-                for &child in &node.children {
-                    if !visited.contains(&child) {
-                        to_visit.push(child);
+            visited.insert(key);
+            visit_order.push(key);
+
+            if let Some(node) = self.nodes.get(&key) {
+                for &child_key in &node.children {
+                    if !visited.contains(&child_key) {
+                        to_visit.push(child_key);
                     }
                 }
             }
         }
-        
+
         // Second pass: process in reverse order (leaves first)
         // Store computed values in a separate map to avoid holding refs
-        let mut computed: HashMap<u64, (u64, u64, u64, u64)> = HashMap::new();
-        
-        for &record in visit_order.iter().rev() {
+        let mut computed: HashMap<NodeKey, (u64, u64, u64, u64)> = HashMap::new();
+
+        for &key in visit_order.iter().rev() {
             let (children, file_size, allocated_size, is_directory) = {
-                if let Some(node) = self.nodes.get(&record) {
+                if let Some(node) = self.nodes.get(&key) {
                     (node.children.clone(), node.file_size, node.allocated_size, node.is_directory)
                 } else {
                     continue;
                 }
             };
-            
+
             let mut total_size = file_size;
             let mut total_allocated = allocated_size;
             let mut file_count = if is_directory { 0 } else { 1 };
             let mut dir_count = if is_directory { 1 } else { 0 };
-            
+
             // Sum up children's computed values
-            for child_id in children {
-                if let Some(&(cs, ca, fc, dc)) = computed.get(&child_id) {
+            for child_key in children {
+                if let Some(&(cs, ca, fc, dc)) = computed.get(&child_key) {
                     total_size += cs;
                     total_allocated += ca;
                     file_count += fc;
                     dir_count += dc;
                 }
             }
-            
-            computed.insert(record, (total_size, total_allocated, file_count, dir_count));
-            
+
+            computed.insert(key, (total_size, total_allocated, file_count, dir_count));
+
             // Update the node
-            if let Some(mut node) = self.nodes.get_mut(&record) {
+            if let Some(mut node) = self.nodes.get_mut(&key) {
                 node.total_size = total_size;
                 node.total_allocated = total_allocated;
                 node.file_count = file_count;
@@ -399,21 +630,22 @@ impl FileTree {
     }
 
     /// Iterate over all nodes
-    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<u64, TreeNode>> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<NodeKey, TreeNode>> + '_ {
         self.nodes.iter()
     }
 
     /// Find orphaned nodes (no valid parent)
-    pub fn find_orphans(&self) -> Vec<u64> {
+    pub fn find_orphans(&self) -> Vec<NodeKey> {
         let mut orphans = Vec::new();
 
         for entry in self.nodes.iter() {
             let node = entry.value();
+            // Check if parent exists in the record index
             if node.parent_record_number != 0
                 && node.parent_record_number != self.root_record
-                && !self.nodes.contains_key(&node.parent_record_number)
+                && !self.record_index.contains_key(&node.parent_record_number)
             {
-                orphans.push(node.record_number);
+                orphans.push(node.key());
             }
         }
 
@@ -446,9 +678,9 @@ impl FileTree {
     /// accurate than MFT data for certain files (sparse files, hardlinks,
     /// files managed by filter drivers, etc.)
     ///
-    /// Takes a slice of (record_number, file_reference_number) pairs.
-    /// Returns a HashMap of record_number -> (file_size, modification_time) for successful updates.
-    pub fn refresh_metadata(&self, entries: &[(u64, u64)]) -> std::collections::HashMap<u64, (u64, u64)> {
+    /// Takes a slice of (NodeKey, file_reference_number) pairs.
+    /// Returns a HashMap of NodeKey -> (file_size, modification_time) for successful updates.
+    pub fn refresh_metadata(&self, entries: &[(NodeKey, u64)]) -> std::collections::HashMap<NodeKey, (u64, u64)> {
         use crate::ntfs::winapi::get_file_metadata_by_id;
 
         let mut results = std::collections::HashMap::new();
@@ -460,9 +692,9 @@ impl FileTree {
         };
 
         // Fetch metadata for each file using full FRN
-        for &(record_num, file_ref) in entries {
+        for &(key, file_ref) in entries {
             // Skip system MFT records (0-15 are reserved)
-            if record_num < 16 {
+            if key.record_number < 16 {
                 continue;
             }
 
@@ -470,17 +702,17 @@ impl FileTree {
             match get_file_metadata_by_id(&volume_handle, file_ref) {
                 Ok(metadata) => {
                     // Update the node in the tree
-                    if let Some(mut node) = self.nodes.get_mut(&record_num) {
+                    if let Some(mut node) = self.nodes.get_mut(&key) {
                         node.file_size = metadata.file_size;
                         node.creation_time = metadata.creation_time;
                         node.modification_time = metadata.modification_time;
                         node.total_size = metadata.file_size;
                     }
-                    results.insert(record_num, (metadata.file_size, metadata.modification_time));
+                    results.insert(key, (metadata.file_size, metadata.modification_time));
                 }
                 Err(e) => {
-                    eprintln!("[metadata] Failed for record {} (FRN 0x{:016X}): {}",
-                        record_num, file_ref, e);
+                    eprintln!("[metadata] Failed for key {:?} (FRN 0x{:016X}): {}",
+                        key, file_ref, e);
                 }
             }
         }
@@ -491,17 +723,17 @@ impl FileTree {
     /// Refresh metadata for a single file, returning updated values
     ///
     /// Returns Some((file_size, modification_time)) if successful, None otherwise.
-    pub fn refresh_single_metadata(&self, record_number: u64) -> Option<(u64, u64)> {
+    pub fn refresh_single_metadata(&self, key: &NodeKey) -> Option<(u64, u64)> {
         use crate::ntfs::winapi::get_file_metadata_by_id;
 
         // Get the node to retrieve its full file reference number
-        let file_ref = self.nodes.get(&record_number)?.file_reference_number;
+        let file_ref = self.nodes.get(key)?.file_reference_number;
 
         let volume_handle = open_volume_for_file_id(self.drive_letter).ok()?;
         let metadata = get_file_metadata_by_id(&volume_handle, file_ref).ok()?;
 
         // Update the node in the tree
-        if let Some(mut node) = self.nodes.get_mut(&record_number) {
+        if let Some(mut node) = self.nodes.get_mut(key) {
             node.file_size = metadata.file_size;
             node.creation_time = metadata.creation_time;
             node.modification_time = metadata.modification_time;
@@ -545,18 +777,43 @@ impl TreeBuilder {
     }
 
     /// Add entries from MFT parsing
+    ///
+    /// This method handles hard links by creating separate tree nodes for each
+    /// $FILE_NAME attribute with a different parent directory. Each hard link
+    /// is stored with a unique NodeKey (record_number, parent_record_number).
     pub fn add_file_entries(&mut self, entries: impl Iterator<Item = FileEntry>) {
         for entry in entries {
             if !entry.is_valid {
                 continue;
             }
 
-            // Check if node exists (from USN) and update, or create new
-            if let Some(mut existing) = self.tree.nodes.get_mut(&entry.record_number) {
+            // Primary key for this entry
+            let primary_key = NodeKey::new(entry.record_number, entry.parent_record_number);
+
+            // Check if this specific node already exists and update it
+            if let Some(mut existing) = self.tree.nodes.get_mut(&primary_key) {
                 existing.update_from_file_entry(&entry);
             } else {
+                // Create primary node
                 let node = TreeNode::from_file_entry(&entry);
                 self.tree.insert(node);
+            }
+
+            // Create additional nodes for hard links (different parent directories)
+            for link in &entry.hard_links {
+                // Skip if this is the same as the primary entry
+                if link.parent_record_number == entry.parent_record_number
+                    && link.name == entry.name {
+                    continue;
+                }
+
+                // Check if this hard link already exists
+                let link_key = NodeKey::new(entry.record_number, link.parent_record_number);
+                if !self.tree.nodes.contains_key(&link_key) {
+                    // Create a node for this hard link
+                    let link_node = TreeNode::from_hard_link(&entry, link);
+                    self.tree.insert(link_node);
+                }
             }
         }
     }
@@ -577,19 +834,27 @@ impl TreeBuilder {
 
     /// Ensure all children are linked to parents
     fn link_children(&mut self) {
-        // Collect all (child, parent) pairs
-        let pairs: Vec<(u64, u64)> = self
+        // Collect all (child_key, parent_record_number) pairs
+        let pairs: Vec<(NodeKey, u64)> = self
             .tree
             .nodes
             .iter()
-            .map(|e| (e.record_number, e.parent_record_number))
+            .map(|e| (*e.key(), e.parent_record_number))
             .collect();
 
-        // Link children
-        for (child_id, parent_id) in pairs {
-            if let Some(mut parent) = self.tree.nodes.get_mut(&parent_id) {
-                if !parent.children.contains(&child_id) {
-                    parent.children.push(child_id);
+        // Link children to parents
+        // For each child, find the parent node(s) by record number
+        for (child_key, parent_record) in pairs {
+            // Look up all nodes with this parent record number
+            if let Some(parent_keys) = self.tree.record_index.get(&parent_record) {
+                // Add child to the first matching parent (directories typically have one entry)
+                for parent_key in parent_keys.iter() {
+                    if let Some(mut parent_node) = self.tree.nodes.get_mut(parent_key) {
+                        if !parent_node.children.contains(&child_key) {
+                            parent_node.children.push(child_key);
+                        }
+                        break; // Only add to one parent node
+                    }
                 }
             }
         }
@@ -603,12 +868,30 @@ impl TreeBuilder {
 /// Search result entry
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// Unique key for this result (record_number, parent_record_number)
+    pub key: NodeKey,
+    /// MFT record number (convenience accessor)
     pub record_number: u64,
     pub name: String,
     pub path: String,
     pub file_size: u64,
     pub is_directory: bool,
     pub modification_time: u64,
+}
+
+impl SearchResult {
+    /// Create a SearchResult from a TreeNode and its path
+    fn from_node(node: &TreeNode, path: String) -> Self {
+        Self {
+            key: node.key(),
+            record_number: node.record_number,
+            name: node.name.clone(),
+            path,
+            file_size: node.file_size,
+            is_directory: node.is_directory,
+            modification_time: node.modification_time,
+        }
+    }
 }
 
 impl FileTree {
@@ -623,19 +906,15 @@ impl FileTree {
             }
 
             let node = entry.value();
+            let key = *entry.key();
+
             // Skip entries with no name (incomplete MFT records)
             if node.name.is_empty() {
                 continue;
             }
             if node.name.to_lowercase().contains(&pattern_lower) {
-                results.push(SearchResult {
-                    record_number: node.record_number,
-                    name: node.name.clone(),
-                    path: self.build_path(node.record_number),
-                    file_size: node.file_size,
-                    is_directory: node.is_directory,
-                    modification_time: node.modification_time,
-                });
+                let path = self.build_path_for_key(&key);
+                results.push(SearchResult::from_node(node, path));
             }
         }
 
@@ -660,8 +939,9 @@ impl FileTree {
             .iter()
             .filter(|e| !e.value().is_directory && !e.value().name.is_empty())
             .map(|e| {
+                let key = *e.key();
                 let node = e.value();
-                (node.record_number, node.file_size)
+                (key, node.file_size)
             })
             .collect();
 
@@ -670,14 +950,10 @@ impl FileTree {
 
         files
             .into_iter()
-            .filter_map(|(record_num, _)| {
-                self.get(record_num).map(|node| SearchResult {
-                    record_number: node.record_number,
-                    name: node.name.clone(),
-                    path: self.build_path(node.record_number),
-                    file_size: node.file_size,
-                    is_directory: node.is_directory,
-                    modification_time: node.modification_time,
+            .filter_map(|(key, _)| {
+                self.get_by_key(&key).map(|node| {
+                    let path = self.build_path_for_key(&key);
+                    SearchResult::from_node(&node, path)
                 })
             })
             .collect()
@@ -690,8 +966,9 @@ impl FileTree {
             .iter()
             .filter(|e| e.value().is_directory)
             .map(|e| {
+                let key = *e.key();
                 let node = e.value();
-                (node.record_number, node.total_size)
+                (key, node.total_size)
             })
             .collect();
 
@@ -699,14 +976,19 @@ impl FileTree {
         dirs.truncate(count);
 
         dirs.into_iter()
-            .filter_map(|(record_num, _)| {
-                self.get(record_num).map(|node| SearchResult {
-                    record_number: node.record_number,
-                    name: node.name.clone(),
-                    path: self.build_path(node.record_number),
-                    file_size: node.total_size,
-                    is_directory: node.is_directory,
-                    modification_time: node.modification_time,
+            .filter_map(|(key, _)| {
+                self.get_by_key(&key).map(|node| {
+                    let path = self.build_path_for_key(&key);
+                    // For directories, use total_size instead of file_size
+                    SearchResult {
+                        key,
+                        record_number: node.record_number,
+                        name: node.name.clone(),
+                        path,
+                        file_size: node.total_size,
+                        is_directory: node.is_directory,
+                        modification_time: node.modification_time,
+                    }
                 })
             })
             .collect()

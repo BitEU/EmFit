@@ -12,12 +12,23 @@ use std::collections::{HashMap, HashSet};
 // Parsed File Entry
 // ============================================================================
 
+/// A hard link entry - represents one $FILE_NAME attribute
+#[derive(Debug, Clone)]
+pub struct HardLink {
+    /// Parent directory record number for this link
+    pub parent_record_number: u64,
+    /// File name for this link
+    pub name: String,
+    /// Filename namespace (Win32, DOS, POSIX, Win32AndDos)
+    pub namespace: FilenameNamespace,
+}
+
 /// Complete parsed information for a file/directory
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     /// MFT record number
     pub record_number: u64,
-    /// Parent directory record number
+    /// Parent directory record number (from best filename)
     pub parent_record_number: u64,
     /// File name (best available: Win32 > Win32+DOS > POSIX > DOS)
     pub name: String,
@@ -47,6 +58,9 @@ pub struct FileEntry {
     pub is_complete: bool,
     /// Extension MFT record numbers that may contain additional attributes (e.g., $FILE_NAME)
     pub extension_records: Vec<u64>,
+    /// All hard links (different $FILE_NAME attributes with different parents)
+    /// Each entry represents a different location where this file appears
+    pub hard_links: Vec<HardLink>,
 }
 
 impl Default for FileEntry {
@@ -68,6 +82,7 @@ impl Default for FileEntry {
             is_valid: false,
             is_complete: false,
             extension_records: Vec::new(),
+            hard_links: Vec::new(),
         }
     }
 }
@@ -493,8 +508,12 @@ impl MftParser {
         let record_size = self.volume_data.bytes_per_file_record_segment as usize;
         let mut offset = header.first_attribute_offset as usize;
 
-        // Track best filename (prefer Win32 namespace)
-        let mut best_filename: Option<(FilenameNamespace, String)> = None;
+        // Track best filename (prefer Win32 namespace) for the primary name/parent
+        let mut best_filename: Option<(FilenameNamespace, String, u64)> = None;
+
+        // Collect ALL $FILE_NAME attributes for hard link support
+        // Each $FILE_NAME can have a different parent directory (hard link)
+        let mut all_filenames: Vec<(FilenameNamespace, String, u64)> = Vec::new();
 
         // Track extension record numbers we need to read for $FILE_NAME
         let mut extension_records: Vec<u64> = Vec::new();
@@ -522,26 +541,28 @@ impl MftParser {
                 }
                 Some(AttributeType::FileName) => {
                     if let Some((ns, name, parent)) = self.parse_filename(attr_data)? {
-                        // Update parent reference
-                        if entry.parent_record_number == 0 {
-                            entry.parent_record_number = parent;
+                        // Skip DOS-only names (like Everything does)
+                        // DOS names are short 8.3 aliases, not real hard links
+                        if ns != FilenameNamespace::Dos {
+                            // Collect ALL non-DOS filenames for hard link tracking
+                            all_filenames.push((ns, name.clone(), parent));
                         }
 
-                        // Keep best filename (Win32 > Win32+DOS > POSIX > DOS)
+                        // Keep best filename for primary entry (Win32 > Win32+DOS > POSIX > DOS)
                         let dominated = match (&best_filename, ns) {
                             (None, _) => true,
-                            (Some((FilenameNamespace::Dos, _)), _) => ns != FilenameNamespace::Dos,
-                            (Some((FilenameNamespace::Posix, _)), ns) => {
+                            (Some((FilenameNamespace::Dos, _, _)), _) => ns != FilenameNamespace::Dos,
+                            (Some((FilenameNamespace::Posix, _, _)), ns) => {
                                 ns == FilenameNamespace::Win32 || ns == FilenameNamespace::Win32AndDos
                             }
-                            (Some((FilenameNamespace::Win32AndDos, _)), ns) => {
+                            (Some((FilenameNamespace::Win32AndDos, _, _)), ns) => {
                                 ns == FilenameNamespace::Win32
                             }
-                            (Some((FilenameNamespace::Win32, _)), _) => false,
+                            (Some((FilenameNamespace::Win32, _, _)), _) => false,
                         };
 
                         if dominated {
-                            best_filename = Some((ns, name));
+                            best_filename = Some((ns, name, parent));
                         }
                     }
                 }
@@ -562,10 +583,22 @@ impl MftParser {
             offset += attr_header.length as usize;
         }
 
-        // Set final filename from base record
-        if let Some((_, name)) = best_filename {
+        // Set primary filename and parent from best match
+        if let Some((_, name, parent)) = best_filename {
             entry.name = name;
+            entry.parent_record_number = parent;
         }
+
+        // Convert all filenames to HardLink entries
+        // This allows creating separate tree entries for each hard link location
+        entry.hard_links = all_filenames
+            .into_iter()
+            .map(|(ns, name, parent)| HardLink {
+                parent_record_number: parent,
+                name,
+                namespace: ns,
+            })
+            .collect();
 
         // Store extension records for later processing by the caller
         entry.extension_records = extension_records;

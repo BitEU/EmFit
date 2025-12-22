@@ -12,7 +12,7 @@ pub mod usn;
 pub mod winapi;
 
 // Re-export commonly used types
-pub use mft::{FileEntry, MftParser};
+pub use mft::{FileEntry, HardLink, MftParser};
 pub use structs::{
     AttributeType, DataRun, FileNameAttribute, FilenameNamespace, MftRecordHeader,
     NtfsVolumeData, StandardInformation, UsnJournalData, UsnRecord,

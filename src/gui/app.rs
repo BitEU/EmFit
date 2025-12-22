@@ -1,5 +1,6 @@
 //! Main EmFit Application
 
+use crate::file_tree::NodeKey;
 use crate::gui::search::SearchState;
 use crate::gui::table::{ResultsTable, SortColumn, SortOrder};
 use crate::{FileTree, MultiVolumeScanner, ScanConfig, TreeNode, VolumeScanner};
@@ -22,7 +23,8 @@ pub enum BackgroundMessage {
 #[derive(Clone)]
 pub struct EntryData {
     pub tree_index: usize,
-    pub record_number: u64,
+    /// Composite key (record_number, parent_record_number) for unique identification
+    pub key: NodeKey,
     /// Full file reference number (for OpenFileById metadata refresh)
     pub file_reference_number: u64,
     pub name_lower: String,  // Pre-lowercased for fast sorting
@@ -183,14 +185,21 @@ impl EmFitApp {
                         let files = tree.stats.total_files;
                         let dirs = tree.stats.total_directories;
 
+                        // Check if we already have a tree for this drive (prevent duplicates)
+                        if self.trees.iter().any(|t| t.drive_letter == drive) {
+                            // Skip duplicate scan completion
+                            continue;
+                        }
+
                         // Build entry data with cached sort keys
                         let tree_index = self.trees.len();
                         for entry in tree.iter() {
+                            let key = *entry.key();
                             let node = entry.value();
                             if !node.name.is_empty() {
                                 self.all_entries.push(EntryData {
                                     tree_index,
-                                    record_number: node.record_number,
+                                    key,
                                     file_reference_number: node.file_reference_number,
                                     name_lower: node.name.to_lowercase(),
                                     file_size: node.file_size,
@@ -290,7 +299,7 @@ impl EmFitApp {
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         // Get original name from tree
                                         if let Some(tree) = self.trees.get(entry.tree_index) {
-                                            if let Some(node) = tree.get(entry.record_number) {
+                                            if let Some(node) = tree.get_by_key(&entry.key) {
                                                 let _ = clipboard.set_text(&node.name);
                                             }
                                         }
@@ -359,7 +368,7 @@ impl EmFitApp {
                         if let Some(&entry_idx) = self.filtered_indices.get(selected_idx) {
                             if let Some(entry) = self.all_entries.get(entry_idx) {
                                 if let Some(tree) = self.trees.get(entry.tree_index) {
-                                    let path = tree.build_path(entry.record_number);
+                                    let path = tree.build_path_for_key(&entry.key);
                                     ui.label(format!(
                                         "Size: {}, Path: {}",
                                         crate::format_size(entry.file_size),
@@ -439,8 +448,8 @@ impl EmFitApp {
         // Collect entries that need metadata refresh (0 size or 0 time for non-directories)
         // Limit to visible results to avoid excessive API calls
         let max_refresh = 10000; // Reasonable limit
-        // (entry_idx, tree_idx, record_num, file_reference_number)
-        let mut needs_refresh: Vec<(usize, usize, u64, u64)> = Vec::new();
+        // (entry_idx, tree_idx, key, file_reference_number)
+        let mut needs_refresh: Vec<(usize, usize, NodeKey, u64)> = Vec::new();
 
         for &entry_idx in self.filtered_indices.iter().take(max_refresh) {
             if self.pending_metadata_refresh.contains(&entry_idx) {
@@ -453,7 +462,7 @@ impl EmFitApp {
                     needs_refresh.push((
                         entry_idx,
                         entry.tree_index,
-                        entry.record_number,
+                        entry.key,
                         entry.file_reference_number,
                     ));
                     self.pending_metadata_refresh.insert(entry_idx);
@@ -477,10 +486,10 @@ impl EmFitApp {
         thread::spawn(move || {
             use std::collections::HashMap;
 
-            // Group by tree index: tree_idx -> Vec<(entry_idx, record_num, file_ref)>
-            let mut by_tree: HashMap<usize, Vec<(usize, u64, u64)>> = HashMap::new();
-            for (entry_idx, tree_idx, record_num, file_ref) in needs_refresh {
-                by_tree.entry(tree_idx).or_default().push((entry_idx, record_num, file_ref));
+            // Group by tree index: tree_idx -> Vec<(entry_idx, key, file_ref)>
+            let mut by_tree: HashMap<usize, Vec<(usize, NodeKey, u64)>> = HashMap::new();
+            for (entry_idx, tree_idx, key, file_ref) in needs_refresh {
+                by_tree.entry(tree_idx).or_default().push((entry_idx, key, file_ref));
             }
 
             let mut updates: Vec<(usize, u64, u64)> = Vec::new();
@@ -488,18 +497,18 @@ impl EmFitApp {
             // Process each tree
             for (tree_idx, entries) in by_tree {
                 if let Some(tree) = trees.get(tree_idx) {
-                    // Build pairs of (record_num, file_reference_number)
-                    let refresh_pairs: Vec<(u64, u64)> = entries
+                    // Build pairs of (NodeKey, file_reference_number)
+                    let refresh_pairs: Vec<(NodeKey, u64)> = entries
                         .iter()
-                        .map(|(_, rn, fr)| (*rn, *fr))
+                        .map(|(_, key, fr)| (*key, *fr))
                         .collect();
 
                     // Refresh metadata in the tree using full FRN
                     let metadata_results = tree.refresh_metadata(&refresh_pairs);
 
                     // Collect updated values
-                    for (entry_idx, record_num, _) in entries {
-                        if let Some(&(file_size, modification_time)) = metadata_results.get(&record_num) {
+                    for (entry_idx, key, _) in entries {
+                        if let Some(&(file_size, modification_time)) = metadata_results.get(&key) {
                             updates.push((entry_idx, file_size, modification_time));
                         }
                     }
@@ -514,7 +523,7 @@ impl EmFitApp {
     pub fn get_node(&self, entry_index: usize) -> Option<(TreeNode, &FileTree)> {
         let entry = self.all_entries.get(entry_index)?;
         let tree = self.trees.get(entry.tree_index)?;
-        let node = tree.get(entry.record_number)?;
+        let node = tree.get_by_key(&entry.key)?;
         Some((node, tree))
     }
 }
@@ -557,11 +566,18 @@ impl EmFitApp {
     fn get_row_data(&self, entry_index: usize) -> Option<RowData> {
         let entry = self.all_entries.get(entry_index)?;
         let tree = self.trees.get(entry.tree_index)?;
-        let node = tree.get(entry.record_number)?;
-        let path = tree.build_path(entry.record_number);
+        let node = tree.get_by_key(&entry.key)?;
+        let path = tree.build_path_for_key(&entry.key);
+        // Show the directory containing the item in the Path column (exclude the file/dir name)
+        // Use Path::parent() for robust handling of root and drive paths.
+        let parent_dir = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
         Some(RowData {
             name: node.name,
-            path,
+            path: parent_dir,
             file_size: entry.file_size,
             is_directory: entry.is_directory,
             modification_time: entry.modification_time,
