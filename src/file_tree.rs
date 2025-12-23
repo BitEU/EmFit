@@ -181,6 +181,9 @@ pub struct FileTree {
     /// Secondary index: record_number -> Vec<NodeKey>
     /// Allows quick lookup of all hard links for a given record
     record_index: DashMap<u64, Vec<NodeKey>>,
+    /// Name index: (parent_record_number, name_lowercase) -> NodeKey
+    /// Used to deduplicate files with the same parent and name (like Everything does)
+    name_index: DashMap<(u64, String), NodeKey>,
     /// Root record number (typically 5)
     root_record: u64,
     /// Statistics
@@ -207,6 +210,7 @@ impl FileTree {
             drive_letter,
             nodes: DashMap::new(),
             record_index: DashMap::new(),
+            name_index: DashMap::new(),
             root_record: 5, // NTFS root is always record 5
             stats: TreeStats::default(),
             bytes_per_record: 1024, // Default MFT record size
@@ -219,6 +223,7 @@ impl FileTree {
             drive_letter,
             nodes: DashMap::new(),
             record_index: DashMap::new(),
+            name_index: DashMap::new(),
             root_record: 5,
             stats: TreeStats::default(),
             bytes_per_record,
@@ -231,12 +236,20 @@ impl FileTree {
     }
 
     /// Insert a node into the tree
-    pub fn insert(&self, node: TreeNode) {
-        let is_dir = node.is_directory;
-        let size = node.file_size;
-        let allocated = node.allocated_size;
+    /// Returns true if the node was inserted, false if a duplicate (same parent+name) already exists
+    pub fn insert(&self, node: TreeNode) -> bool {
         let key = node.key();
-        let parent_key = NodeKey::new(key.parent_record_number, 0); // Parent's key needs lookup
+        let name_key = (key.parent_record_number, node.name.to_lowercase());
+
+        // Check if a file with the same parent and name already exists (like Everything does)
+        // This deduplicates entries that have the same path but different record numbers
+        // (e.g., from multiple $FILE_NAME attributes with different namespaces)
+        if self.name_index.contains_key(&name_key) {
+            return false; // Duplicate path - skip
+        }
+
+        // Insert into name index first
+        self.name_index.insert(name_key, key);
 
         // Insert into main map
         self.nodes.insert(key, node);
@@ -260,12 +273,7 @@ impl FileTree {
             }
         }
 
-        // Update stats
-        if is_dir {
-            // Use atomic operations in production; simplified here
-        } else {
-            // Use atomic operations in production
-        }
+        true
     }
 
     /// Get a node by NodeKey
