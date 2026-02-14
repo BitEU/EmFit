@@ -1,10 +1,10 @@
-//! EmFit CLI
+//! EmFit - Ultra-fast NTFS file scanner
 //!
-//! Command-line interface for the EmFit file scanner.
-//! Provides both command-line and interactive search modes.
+//! Launches a full-screen TUI by default.
+//! Use `emfit cli <subcommand>` for the traditional CLI interface.
 
 use clap::{Parser, Subcommand};
-use console::{style, Term};
+use console::style;
 use indicatif::HumanDuration;
 use emfit::{
     format_size, FileTree,
@@ -15,8 +15,8 @@ use std::time::Instant;
 
 /// EmFit - Ultra-fast NTFS file scanner
 ///
-/// Combines USN Journal enumeration with direct MFT reading
-/// for instant, accurate file system scanning.
+/// Run without arguments to launch the interactive TUI.
+/// Use `emfit cli <subcommand>` for the traditional CLI.
 #[derive(Parser)]
 #[command(name = "emfit")]
 #[command(author = "EmFit Contributors")]
@@ -24,11 +24,20 @@ use std::time::Instant;
 #[command(about = "Ultra-fast NTFS file scanner", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Access CLI subcommands (scan, search, largest, etc.)
+    Cli {
+        #[command(subcommand)]
+        subcmd: CliCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CliCommands {
     /// Scan a volume and display statistics
     Scan {
         /// Drive letter to scan (e.g., C)
@@ -168,43 +177,56 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::Scan {
-            drive,
-            usn,
-            mft,
-            no_physical,
-            hidden,
-            system,
-            output,
-        } => cmd_scan(drive, usn, mft, !no_physical, hidden, system, &output),
+    match cli.command {
+        None => {
+            // No subcommand -> launch TUI
+            if let Err(e) = emfit::tui::run() {
+                eprintln!("{} {}", style("Error:").red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Cli { subcmd }) => {
+            let result = match subcmd {
+                CliCommands::Scan {
+                    drive,
+                    usn,
+                    mft,
+                    no_physical,
+                    hidden,
+                    system,
+                    output,
+                } => cmd_scan(drive, usn, mft, !no_physical, hidden, system, &output),
 
-        Commands::Search { drive, pattern, max } => cmd_search(drive, &pattern, max),
+                CliCommands::Search { drive, pattern, max } => cmd_search(drive, &pattern, max),
 
-        Commands::Largest { drive, count, dirs } => cmd_largest(drive, count, dirs),
+                CliCommands::Largest { drive, count, dirs } => cmd_largest(drive, count, dirs),
 
-        Commands::TreeSize { drive, path, depth } => cmd_tree_size(drive, path.as_deref(), depth),
+                CliCommands::TreeSize { drive, path, depth } => {
+                    cmd_tree_size(drive, path.as_deref(), depth)
+                }
 
-        Commands::Volumes => cmd_volumes(),
+                CliCommands::Volumes => cmd_volumes(),
 
-        Commands::Monitor { drive } => cmd_monitor(drive),
+                CliCommands::Monitor { drive } => cmd_monitor(drive),
 
-        Commands::Export {
-            drive,
-            output,
-            format,
-        } => cmd_export(drive, &output, &format),
+                CliCommands::Export {
+                    drive,
+                    output,
+                    format,
+                } => cmd_export(drive, &output, &format),
 
-        Commands::Debug { drive, pattern } => cmd_debug(drive, &pattern),
+                CliCommands::Debug { drive, pattern } => cmd_debug(drive, &pattern),
 
-        Commands::ReadMft { drive, record } => cmd_read_mft(drive, record),
+                CliCommands::ReadMft { drive, record } => cmd_read_mft(drive, record),
 
-        Commands::UsnCount { drive } => cmd_usn_count(drive),
-    };
+                CliCommands::UsnCount { drive } => cmd_usn_count(drive),
+            };
 
-    if let Err(e) = result {
-        eprintln!("{} {}", style("Error:").red().bold(), e);
-        std::process::exit(1);
+            if let Err(e) = result {
+                eprintln!("{} {}", style("Error:").red().bold(), e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -218,7 +240,6 @@ fn cmd_scan(
     include_system: bool,
     output_format: &str,
 ) -> emfit::Result<()> {
-    let term = Term::stdout();
     let start = Instant::now();
 
     println!(
