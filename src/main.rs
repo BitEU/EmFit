@@ -156,6 +156,10 @@ enum Commands {
 }
 
 fn main() {
+    // Initialize logging
+    emfit::logging::init();
+    emfit::logging::info("MAIN", "EmFit starting up");
+
     let cli = Cli::parse();
 
     let result = match cli.command {

@@ -5,6 +5,7 @@
 
 use crate::error::{Result, EmFitError};
 use crate::file_tree::{FileTree, TreeBuilder, TreeNode};
+use crate::logging;
 use crate::ntfs::{
     open_volume, FileEntry, MftParser, NtfsVolumeData, UsnEntry, UsnMonitor, UsnScanner,
 };
@@ -141,6 +142,11 @@ impl VolumeScanner {
     pub fn scan(&mut self) -> Result<FileTree> {
         let start_time = Instant::now();
 
+        logging::separator(&format!("SCAN START: Drive {}", self.drive_letter));
+        logging::info("SCANNER", &format!("Config: usn={}, mft={}, hidden={}, system={}",
+            self.config.use_usn, self.config.use_mft,
+            self.config.include_hidden, self.config.include_system));
+
         // Initialize progress bar
         let pb = if self.config.show_progress {
             let pb = ProgressBar::new(100);
@@ -189,11 +195,13 @@ impl VolumeScanner {
             match self.scan_via_usn(&mut builder, pb.as_ref()) {
                 Ok(count) => {
                     usn_success = true;
+                    logging::info("SCANNER", &format!("USN phase complete: {} entries", count));
                     if let Some(ref pb) = pb {
                         pb.set_message(format!("USN: {} entries found", count));
                     }
                 }
                 Err(e) => {
+                    logging::warn("SCANNER", &format!("USN unavailable: {}", e));
                     if let Some(ref pb) = pb {
                         pb.set_message(format!("USN unavailable: {}", e));
                     }
@@ -207,6 +215,7 @@ impl VolumeScanner {
 
         // Phase 3: MFT reading for size information (or full scan if USN failed)
         if self.config.use_mft && (self.config.calculate_sizes || !usn_success) {
+            logging::separator("MFT SCAN PHASE");
             if let Some(ref pb) = pb {
                 if usn_success {
                     pb.set_message("Reading MFT for file sizes...");
@@ -217,6 +226,7 @@ impl VolumeScanner {
             }
 
             self.scan_via_mft(&mut builder, pb.as_ref(), !usn_success)?;
+            logging::info("SCANNER", "MFT phase complete");
         }
 
         if self.is_cancelled() {
@@ -224,11 +234,18 @@ impl VolumeScanner {
         }
 
         // Phase 4: Build and finalize tree
+        logging::separator("BUILD TREE PHASE");
         if let Some(ref pb) = pb {
             pb.set_message("Building file tree...");
         }
 
         let tree = builder.build();
+
+        logging::info("SCANNER", &format!(
+            "Scan complete: {} files, {} dirs, {:.2}s",
+            tree.stats.total_files, tree.stats.total_directories,
+            start_time.elapsed().as_secs_f64()
+        ));
 
         if let Some(ref pb) = pb {
             pb.finish_with_message(format!(
@@ -239,6 +256,7 @@ impl VolumeScanner {
             ));
         }
 
+        logging::flush();
         Ok(tree)
     }
 

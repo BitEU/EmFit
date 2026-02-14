@@ -10,6 +10,7 @@
 //! To properly handle this, we use a composite key `NodeKey(record_number, parent_record_number)`
 //! which allows multiple entries for the same file with different parents.
 
+use crate::logging;
 use crate::ntfs::{FileEntry, UsnEntry};
 use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
 use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, open_volume_for_file_id, SafeHandle};
@@ -91,8 +92,8 @@ impl TreeNode {
         Self {
             record_number: entry.record_number,
             parent_record_number: entry.parent_record_number,
-            // FileEntry doesn't have full FRN, use record_number as fallback
-            file_reference_number: entry.record_number,
+            // Use full FRN from FileEntry (includes sequence number for OpenFileById)
+            file_reference_number: entry.file_reference_number,
             name: entry.name.clone(),
             file_size: entry.file_size,
             allocated_size: entry.allocated_size,
@@ -137,6 +138,11 @@ impl TreeNode {
         self.total_allocated = entry.allocated_size;
         self.creation_time = entry.creation_time;
         self.modification_time = entry.modification_time;
+        // Update file_reference_number if MFT provides a valid one
+        // (MFT's FRN includes sequence number which is more accurate)
+        if entry.file_reference_number != 0 {
+            self.file_reference_number = entry.file_reference_number;
+        }
     }
 
     /// Get the NodeKey for this node
@@ -150,7 +156,8 @@ impl TreeNode {
         Self {
             record_number: entry.record_number,
             parent_record_number: link.parent_record_number,
-            file_reference_number: entry.record_number,
+            // Use full FRN from FileEntry (includes sequence number for OpenFileById)
+            file_reference_number: entry.file_reference_number,
             name: link.name.clone(),
             file_size: entry.file_size,
             allocated_size: entry.allocated_size,
@@ -688,10 +695,15 @@ impl FileTree {
     ///
     /// Takes a slice of (NodeKey, file_reference_number) pairs.
     /// Returns a HashMap of NodeKey -> (file_size, modification_time) for successful updates.
+    ///
+    /// When metadata is refreshed for a file, ALL nodes with the same record_number
+    /// (i.e., all hardlinks) are also updated to ensure consistency.
     pub fn refresh_metadata(&self, entries: &[(NodeKey, u64)]) -> std::collections::HashMap<NodeKey, (u64, u64)> {
         use crate::ntfs::winapi::get_file_metadata_by_id;
 
         let mut results = std::collections::HashMap::new();
+        // Track which record_numbers we've already refreshed to avoid redundant API calls
+        let mut refreshed_records: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         // Open volume root directory handle for OpenFileById
         let volume_handle = match open_volume_for_file_id(self.drive_letter) {
@@ -706,21 +718,46 @@ impl FileTree {
                 continue;
             }
 
+            // Skip if we already refreshed this record (via a different hardlink)
+            if refreshed_records.contains(&key.record_number) {
+                // Still return the result for the caller's key
+                if let Some(node) = self.nodes.get(&key) {
+                    results.insert(key, (node.file_size, node.modification_time));
+                }
+                continue;
+            }
+
             // Use the full file reference number for OpenFileById
             match get_file_metadata_by_id(&volume_handle, file_ref) {
                 Ok(metadata) => {
-                    // Update the node in the tree
-                    if let Some(mut node) = self.nodes.get_mut(&key) {
-                        node.file_size = metadata.file_size;
-                        node.creation_time = metadata.creation_time;
-                        node.modification_time = metadata.modification_time;
-                        node.total_size = metadata.file_size;
+                    refreshed_records.insert(key.record_number);
+
+                    // Update ALL nodes with the same record_number (all hardlinks)
+                    if let Some(all_keys) = self.record_index.get(&key.record_number) {
+                        for hardlink_key in all_keys.iter() {
+                            if let Some(mut node) = self.nodes.get_mut(hardlink_key) {
+                                node.file_size = metadata.file_size;
+                                node.creation_time = metadata.creation_time;
+                                node.modification_time = metadata.modification_time;
+                                node.total_size = metadata.file_size;
+                            }
+                            // Return result for all hardlinks
+                            results.insert(*hardlink_key, (metadata.file_size, metadata.modification_time));
+                        }
+                    } else {
+                        // Fallback: just update the requested node
+                        if let Some(mut node) = self.nodes.get_mut(&key) {
+                            node.file_size = metadata.file_size;
+                            node.creation_time = metadata.creation_time;
+                            node.modification_time = metadata.modification_time;
+                            node.total_size = metadata.file_size;
+                        }
+                        results.insert(key, (metadata.file_size, metadata.modification_time));
                     }
-                    results.insert(key, (metadata.file_size, metadata.modification_time));
                 }
-                Err(e) => {
-                    eprintln!("[metadata] Failed for key {:?} (FRN 0x{:016X}): {}",
-                        key, file_ref, e);
+                Err(_e) => {
+                    // Silently skip failures - file may be deleted or inaccessible
+                    // (Uncomment for debugging: eprintln!("[metadata] Failed for key {:?} (FRN 0x{:016X}): {}", key, file_ref, _e);)
                 }
             }
         }
@@ -731,6 +768,8 @@ impl FileTree {
     /// Refresh metadata for a single file, returning updated values
     ///
     /// Returns Some((file_size, modification_time)) if successful, None otherwise.
+    /// When metadata is refreshed, ALL nodes with the same record_number
+    /// (i.e., all hardlinks) are also updated to ensure consistency.
     pub fn refresh_single_metadata(&self, key: &NodeKey) -> Option<(u64, u64)> {
         use crate::ntfs::winapi::get_file_metadata_by_id;
 
@@ -740,12 +779,24 @@ impl FileTree {
         let volume_handle = open_volume_for_file_id(self.drive_letter).ok()?;
         let metadata = get_file_metadata_by_id(&volume_handle, file_ref).ok()?;
 
-        // Update the node in the tree
-        if let Some(mut node) = self.nodes.get_mut(key) {
-            node.file_size = metadata.file_size;
-            node.creation_time = metadata.creation_time;
-            node.modification_time = metadata.modification_time;
-            node.total_size = metadata.file_size;
+        // Update ALL nodes with the same record_number (all hardlinks)
+        if let Some(all_keys) = self.record_index.get(&key.record_number) {
+            for hardlink_key in all_keys.iter() {
+                if let Some(mut node) = self.nodes.get_mut(hardlink_key) {
+                    node.file_size = metadata.file_size;
+                    node.creation_time = metadata.creation_time;
+                    node.modification_time = metadata.modification_time;
+                    node.total_size = metadata.file_size;
+                }
+            }
+        } else {
+            // Fallback: just update the requested node
+            if let Some(mut node) = self.nodes.get_mut(key) {
+                node.file_size = metadata.file_size;
+                node.creation_time = metadata.creation_time;
+                node.modification_time = metadata.modification_time;
+                node.total_size = metadata.file_size;
+            }
         }
 
         Some((metadata.file_size, metadata.modification_time))
@@ -780,6 +831,17 @@ impl TreeBuilder {
     pub fn add_usn_entries(&mut self, entries: impl Iterator<Item = UsnEntry>) {
         for entry in entries {
             let node = TreeNode::from_usn_entry(&entry);
+
+            // Log tree node creation from USN
+            logging::log_tree_node_create(
+                node.record_number,
+                node.parent_record_number,
+                &node.name,
+                node.file_size,
+                node.modification_time,
+                "USN",
+            );
+
             self.tree.insert(node);
         }
     }
@@ -789,6 +851,11 @@ impl TreeBuilder {
     /// This method handles hard links by creating separate tree nodes for each
     /// $FILE_NAME attribute with a different parent directory. Each hard link
     /// is stored with a unique NodeKey (record_number, parent_record_number).
+    ///
+    /// Critically, after processing each MFT entry, we propagate metadata (size,
+    /// timestamps) to ALL nodes with the same record_number. This ensures that
+    /// hard links discovered via USN (which has no metadata) get updated with
+    /// the actual metadata from MFT.
     pub fn add_file_entries(&mut self, entries: impl Iterator<Item = FileEntry>) {
         for entry in entries {
             if !entry.is_valid {
@@ -800,14 +867,33 @@ impl TreeBuilder {
 
             // Check if this specific node already exists and update it
             if let Some(mut existing) = self.tree.nodes.get_mut(&primary_key) {
+                // Log the update
+                logging::log_tree_node_update(
+                    existing.record_number,
+                    existing.parent_record_number,
+                    &existing.name,
+                    existing.file_size,
+                    entry.file_size,
+                    existing.modification_time,
+                    entry.modification_time,
+                    "MFT_primary_update",
+                );
                 existing.update_from_file_entry(&entry);
             } else {
                 // Create primary node
                 let node = TreeNode::from_file_entry(&entry);
+                logging::log_tree_node_create(
+                    node.record_number,
+                    node.parent_record_number,
+                    &node.name,
+                    node.file_size,
+                    node.modification_time,
+                    "MFT_primary_new",
+                );
                 self.tree.insert(node);
             }
 
-            // Create additional nodes for hard links (different parent directories)
+            // Create additional nodes for hard links found in MFT's $FILE_NAME attributes
             for link in &entry.hard_links {
                 // Skip if this is the same as the primary entry
                 if link.parent_record_number == entry.parent_record_number
@@ -815,12 +901,68 @@ impl TreeBuilder {
                     continue;
                 }
 
-                // Check if this hard link already exists
                 let link_key = NodeKey::new(entry.record_number, link.parent_record_number);
+
+                // Only create if doesn't exist - we'll update all nodes below
                 if !self.tree.nodes.contains_key(&link_key) {
-                    // Create a node for this hard link
                     let link_node = TreeNode::from_hard_link(&entry, link);
+                    logging::log_tree_node_create(
+                        link_node.record_number,
+                        link_node.parent_record_number,
+                        &link_node.name,
+                        link_node.file_size,
+                        link_node.modification_time,
+                        "MFT_hardlink_new",
+                    );
                     self.tree.insert(link_node);
+                }
+            }
+
+            // CRITICAL: Propagate metadata to ALL nodes with this record_number
+            // This handles the case where USN discovered hard links that MFT's
+            // $FILE_NAME attributes don't list (e.g., names in extension records
+            // or different namespace discovery). All hard links share the same
+            // file data, so they must have the same size and timestamps.
+            if let Some(all_keys) = self.tree.record_index.get(&entry.record_number) {
+                let keys: Vec<NodeKey> = all_keys.iter().copied().collect();
+                drop(all_keys); // Release the lock before modifying nodes
+
+                // Log all hardlinks we know about for this record
+                let hardlink_info: Vec<(u64, u64, String)> = keys.iter()
+                    .filter_map(|k| {
+                        self.tree.nodes.get(k).map(|n| (n.record_number, n.parent_record_number, n.name.clone()))
+                    })
+                    .collect();
+                logging::log_all_hardlinks_for_record(entry.record_number, &hardlink_info);
+
+                for key in keys {
+                    // Skip the primary key - already updated above
+                    if key == primary_key {
+                        continue;
+                    }
+
+                    if let Some(mut node) = self.tree.nodes.get_mut(&key) {
+                        // Log propagation
+                        logging::log_metadata_propagation(
+                            entry.record_number,
+                            entry.parent_record_number,
+                            key.parent_record_number,
+                            &node.name,
+                            entry.file_size,
+                            entry.modification_time,
+                        );
+
+                        // Propagate metadata from MFT entry to this hard link
+                        node.file_size = entry.file_size;
+                        node.allocated_size = entry.allocated_size;
+                        node.total_size = entry.file_size;
+                        node.total_allocated = entry.allocated_size;
+                        node.creation_time = entry.creation_time;
+                        node.modification_time = entry.modification_time;
+                        if entry.file_reference_number != 0 {
+                            node.file_reference_number = entry.file_reference_number;
+                        }
+                    }
                 }
             }
         }
@@ -905,6 +1047,7 @@ impl SearchResult {
 impl FileTree {
     /// Search for files matching a pattern
     pub fn search(&self, pattern: &str, max_results: usize) -> Vec<SearchResult> {
+        logging::separator(&format!("SEARCH: '{}'", pattern));
         let pattern_lower = pattern.to_lowercase();
         let mut results = Vec::new();
 
@@ -922,10 +1065,24 @@ impl FileTree {
             }
             if node.name.to_lowercase().contains(&pattern_lower) {
                 let path = self.build_path_for_key(&key);
+
+                // Log each search result with full details
+                logging::log_search_result(
+                    results.len(),
+                    node.record_number,
+                    node.parent_record_number,
+                    &node.name,
+                    &path,
+                    node.file_size,
+                    node.modification_time,
+                    node.file_reference_number,
+                );
+
                 results.push(SearchResult::from_node(node, path));
             }
         }
 
+        logging::info("SEARCH", &format!("Found {} results for '{}'", results.len(), pattern));
         results
     }
 

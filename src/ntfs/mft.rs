@@ -4,6 +4,7 @@
 //! attribute extraction, and data run decoding.
 
 use crate::error::{Result, EmFitError};
+use crate::logging;
 use crate::ntfs::structs::*;
 use crate::ntfs::winapi::*;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,9 @@ pub struct FileEntry {
     pub record_number: u64,
     /// Parent directory record number (from best filename)
     pub parent_record_number: u64,
+    /// Full file reference number (record_number | (sequence_number << 48))
+    /// This is needed for OpenFileById API calls
+    pub file_reference_number: u64,
     /// File name (best available: Win32 > Win32+DOS > POSIX > DOS)
     pub name: String,
     /// File size in bytes
@@ -58,6 +62,8 @@ pub struct FileEntry {
     pub is_complete: bool,
     /// Extension MFT record numbers that may contain additional attributes (e.g., $FILE_NAME)
     pub extension_records: Vec<u64>,
+    /// Extension record containing the $DATA attribute (if not in base record)
+    pub data_extension_record: Option<u64>,
     /// All hard links (different $FILE_NAME attributes with different parents)
     /// Each entry represents a different location where this file appears
     pub hard_links: Vec<HardLink>,
@@ -68,6 +74,7 @@ impl Default for FileEntry {
         Self {
             record_number: 0,
             parent_record_number: 0,
+            file_reference_number: 0,
             name: String::new(),
             file_size: 0,
             allocated_size: 0,
@@ -82,6 +89,7 @@ impl Default for FileEntry {
             is_valid: false,
             is_complete: false,
             extension_records: Vec::new(),
+            data_extension_record: None,
             hard_links: Vec::new(),
         }
     }
@@ -317,9 +325,14 @@ impl MftParser {
         // Apply fixup array (critical for data integrity!)
         self.apply_fixup(record_number, data, &header)?;
 
+        // Construct full file reference number (record_number | (sequence_number << 48))
+        // This is needed for OpenFileById API calls
+        let file_reference_number = record_number | ((header.sequence_number as u64) << 48);
+
         // Create entry
         let mut entry = FileEntry {
             record_number,
+            file_reference_number,
             is_directory: header.is_directory(),
             is_valid: header.is_in_use(),
             hard_link_count: header.hard_link_count,
@@ -334,6 +347,30 @@ impl MftParser {
         self.parse_attributes(data, &header, &mut entry)?;
 
         entry.is_complete = true;
+
+        // Log MFT entry details
+        let hard_links: Vec<(u64, String)> = entry.hard_links
+            .iter()
+            .map(|hl| (hl.parent_record_number, hl.name.clone()))
+            .collect();
+
+        logging::log_mft_entry(
+            entry.record_number,
+            entry.parent_record_number,
+            entry.file_reference_number,
+            &entry.name,
+            entry.file_size,
+            entry.allocated_size,
+            entry.creation_time,
+            entry.modification_time,
+            entry.attributes,
+            entry.is_directory,
+            entry.hard_link_count,
+            &entry.extension_records,
+            entry.data_extension_record,
+            &hard_links,
+        );
+
         Ok(entry)
     }
 
@@ -454,6 +491,67 @@ impl MftParser {
         best_name.map(|(name, parent, _)| (name, parent))
     }
 
+    /// Extract file size from an extension MFT record containing $DATA attribute
+    ///
+    /// Returns (file_size, allocated_size) if found
+    fn extract_size_from_extension(&self, data: &mut [u8]) -> Option<(u64, u64)> {
+        // Parse header
+        let header = MftRecordHeader::from_bytes(data)?;
+
+        if !header.is_valid() {
+            return None;
+        }
+
+        // Apply fixup
+        if self.apply_fixup(0, data, &header).is_err() {
+            return None;
+        }
+
+        // Look for $DATA attribute (type 0x80)
+        let record_size = self.volume_data.bytes_per_file_record_segment as usize;
+        let mut offset = header.first_attribute_offset as usize;
+
+        while offset + 16 <= record_size && offset + 16 <= data.len() {
+            let attr_header = match AttributeHeader::from_bytes(&data[offset..]) {
+                Some(h) => h,
+                None => break,
+            };
+
+            if attr_header.attribute_type == ATTRIBUTE_END_MARKER || attr_header.length == 0 {
+                break;
+            }
+
+            if offset + attr_header.length as usize > data.len() {
+                break;
+            }
+
+            // Look for $DATA attribute (type 0x80) with no name (unnamed = default stream)
+            if attr_header.attribute_type == 0x80 && attr_header.name_length == 0 {
+                let attr_data = &data[offset..offset + attr_header.length as usize];
+
+                if attr_header.non_resident {
+                    // Non-resident $DATA - size is in the non-resident header
+                    if let Some(nr_header) = NonResidentAttributeHeader::from_bytes(attr_data) {
+                        // Only process if this is the first extent (lowest VCN == 0)
+                        if nr_header.lowest_vcn == 0 {
+                            return Some((nr_header.data_size, nr_header.allocated_size));
+                        }
+                    }
+                } else {
+                    // Resident $DATA - size is the content length
+                    if let Some(r_header) = ResidentAttributeHeader::from_bytes(attr_data) {
+                        let size = r_header.value_length as u64;
+                        return Some((size, 0)); // Resident has no allocated clusters
+                    }
+                }
+            }
+
+            offset += attr_header.length as usize;
+        }
+
+        None
+    }
+
     /// Apply fixup array to repair sector boundaries
     ///
     /// NTFS stores the last 2 bytes of each sector in the fixup array
@@ -570,9 +668,11 @@ impl MftParser {
                     self.parse_data_attribute(attr_data, &attr_header, entry)?;
                 }
                 Some(AttributeType::AttributeList) => {
-                    // Parse the attribute list to find extension records with $FILE_NAME
-                    if let Some(ext_records) = self.parse_attribute_list_for_filenames(attr_data, entry.record_number)? {
-                        extension_records.extend(ext_records);
+                    // Parse the attribute list to find extension records with $FILE_NAME and $DATA
+                    let (filename_ext_records, data_ext_record) = self.parse_attribute_list(attr_data, entry.record_number)?;
+                    extension_records.extend(filename_ext_records);
+                    if data_ext_record.is_some() {
+                        entry.data_extension_record = data_ext_record;
                     }
                 }
                 _ => {
@@ -606,12 +706,16 @@ impl MftParser {
         Ok(())
     }
 
-    /// Parse an Attribute List to find extension records containing $FILE_NAME
-    fn parse_attribute_list_for_filenames(
+    /// Parse an Attribute List to find extension records containing important attributes
+    ///
+    /// Returns a tuple of (filename_extension_records, data_extension_record)
+    /// - filename_extension_records: Records containing $FILE_NAME (0x30)
+    /// - data_extension_record: Record containing the primary $DATA (0x80) attribute with VCN 0
+    fn parse_attribute_list(
         &self,
         attr_data: &[u8],
         base_record_number: u64,
-    ) -> Result<Option<Vec<u64>>> {
+    ) -> Result<(Vec<u64>, Option<u64>)> {
         // Get the attribute list content
         let attr_header = AttributeHeader::from_bytes(attr_data).ok_or_else(|| {
             EmFitError::InvalidAttribute(0, "Failed to parse attr list header".to_string())
@@ -620,7 +724,7 @@ impl MftParser {
         let list_data = if attr_header.non_resident {
             // Non-resident attribute list - we'd need to read the data runs
             // This is rare for attribute lists, skip for now
-            return Ok(None);
+            return Ok((Vec::new(), None));
         } else {
             // Resident - get the content directly
             let res_header = ResidentAttributeHeader::from_bytes(attr_data).ok_or_else(|| {
@@ -631,7 +735,7 @@ impl MftParser {
             let content_len = res_header.value_length as usize;
 
             if content_offset + content_len > attr_data.len() {
-                return Ok(None);
+                return Ok((Vec::new(), None));
             }
 
             &attr_data[content_offset..content_offset + content_len]
@@ -641,22 +745,30 @@ impl MftParser {
         let entries = parse_attribute_list(list_data);
 
         // Find extension records that contain $FILE_NAME (type 0x30)
-        let mut extension_records = Vec::new();
+        let mut filename_extension_records = Vec::new();
+        // Find extension record containing $DATA (type 0x80) with starting VCN 0 (primary data stream)
+        let mut data_extension_record: Option<u64> = None;
+
         for entry in entries {
+            let ext_record = entry.record_number();
+
             // Look for FILE_NAME attributes in extension records
             if entry.attribute_type == 0x30 {
-                let ext_record = entry.record_number();
-                if ext_record != base_record_number && !extension_records.contains(&ext_record) {
-                    extension_records.push(ext_record);
+                if ext_record != base_record_number && !filename_extension_records.contains(&ext_record) {
+                    filename_extension_records.push(ext_record);
+                }
+            }
+
+            // Look for primary $DATA attribute (type 0x80, starting VCN 0, no name = unnamed default stream)
+            // Like Everything does at line 97933 and 98028
+            if entry.attribute_type == 0x80 && entry.starting_vcn == 0 && entry.name_length == 0 {
+                if ext_record != base_record_number && data_extension_record.is_none() {
+                    data_extension_record = Some(ext_record);
                 }
             }
         }
 
-        if extension_records.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(extension_records))
-        }
+        Ok((filename_extension_records, data_extension_record))
     }
 
     /// Parse $STANDARD_INFORMATION attribute
@@ -825,11 +937,11 @@ impl MftParser {
         Ok(results)
     }
 
-    /// Parse a batch of MFT records, efficiently resolving extension records for missing file names.
+    /// Parse a batch of MFT records, efficiently resolving extension records for missing file names and sizes.
     ///
-    /// This is a two-pass algorithm:
+    /// This is a multi-pass algorithm:
     /// 1. First pass: Parse all records, collecting those that need extension record resolution
-    /// 2. Second pass: Batch-read all needed extension records and resolve missing names
+    /// 2. Second pass: Batch-read all needed extension records and resolve missing names/sizes
     ///
     /// This is more efficient than reading extension records one-by-one as it minimizes disk seeks.
     pub fn parse_batch_with_extensions(
@@ -837,7 +949,8 @@ impl MftParser {
         batch: Vec<(u64, Vec<u8>)>,
     ) -> Vec<FileEntry> {
         let mut entries: Vec<FileEntry> = Vec::with_capacity(batch.len());
-        let mut needs_extension: Vec<usize> = Vec::new(); // Indices into entries that need extension resolution
+        let mut needs_name_extension: Vec<usize> = Vec::new(); // Indices into entries that need name resolution
+        let mut needs_data_extension: Vec<usize> = Vec::new(); // Indices into entries that need size resolution
         let mut extension_record_set: HashSet<u64> = HashSet::new(); // All extension records we need to read
 
         // First pass: Parse all records
@@ -845,16 +958,29 @@ impl MftParser {
             match self.parse_record(record_num, &mut data) {
                 Ok(entry) => {
                     if entry.is_valid {
-                        // Check if this entry needs extension record resolution
+                        let idx = entries.len();
+
+                        // Check if this entry needs $FILE_NAME extension record resolution
                         if entry.name.is_empty() && !entry.extension_records.is_empty() {
-                            // Collect all extension record numbers we need
                             for ext_rec in &entry.extension_records {
                                 if *ext_rec != record_num {
                                     extension_record_set.insert(*ext_rec);
                                 }
                             }
-                            needs_extension.push(entries.len());
+                            needs_name_extension.push(idx);
                         }
+
+                        // Check if this entry needs $DATA extension record resolution
+                        // (file_size == 0 and we have a data extension record to read)
+                        if entry.file_size == 0 && !entry.is_directory {
+                            if let Some(data_ext_rec) = entry.data_extension_record {
+                                if data_ext_rec != record_num {
+                                    extension_record_set.insert(data_ext_rec);
+                                    needs_data_extension.push(idx);
+                                }
+                            }
+                        }
+
                         entries.push(entry);
                     }
                 }
@@ -866,7 +992,7 @@ impl MftParser {
         }
 
         // If no entries need extension resolution, we're done
-        if needs_extension.is_empty() {
+        if needs_name_extension.is_empty() && needs_data_extension.is_empty() {
             return entries;
         }
 
@@ -875,16 +1001,22 @@ impl MftParser {
         let mut extension_records: Vec<u64> = extension_record_set.into_iter().collect();
         extension_records.sort_unstable();
 
-        // Read extension records and extract filenames
+        // Read extension records and extract filenames and sizes
         let mut extension_names: HashMap<u64, (String, u64)> = HashMap::new();
+        let mut extension_sizes: HashMap<u64, (u64, u64)> = HashMap::new(); // record -> (file_size, allocated_size)
 
         for ext_record_num in extension_records {
             match self.read_record(ext_record_num) {
                 Ok(mut ext_data) => {
+                    // Extract filename if available
                     if let Some((name, parent)) = self.extract_filename_from_extension(&mut ext_data) {
                         if !name.is_empty() {
                             extension_names.insert(ext_record_num, (name, parent));
                         }
+                    }
+                    // Extract file size if available
+                    if let Some((file_size, allocated_size)) = self.extract_size_from_extension(&mut ext_data) {
+                        extension_sizes.insert(ext_record_num, (file_size, allocated_size));
                     }
                 }
                 Err(_) => {
@@ -895,7 +1027,7 @@ impl MftParser {
         }
 
         // Third pass: Apply extension record names to entries that need them
-        for idx in needs_extension {
+        for idx in needs_name_extension {
             let entry = &mut entries[idx];
 
             // Try each extension record for this entry until we find a name
@@ -910,9 +1042,22 @@ impl MftParser {
             }
         }
 
+        // Fourth pass: Apply extension record sizes to entries that need them
+        for idx in needs_data_extension {
+            let entry = &mut entries[idx];
+
+            if let Some(data_ext_rec) = entry.data_extension_record {
+                if let Some(&(file_size, allocated_size)) = extension_sizes.get(&data_ext_rec) {
+                    entry.file_size = file_size;
+                    entry.allocated_size = allocated_size;
+                }
+            }
+        }
+
         // Clear extension_records from all entries (no longer needed)
         for entry in &mut entries {
             entry.extension_records.clear();
+            entry.data_extension_record = None;
         }
 
         entries

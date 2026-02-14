@@ -4,6 +4,7 @@
 //! This is the method used by Everything for instant file indexing.
 
 use crate::error::{Result, EmFitError};
+use crate::logging;
 use crate::ntfs::mft::FileEntry;
 use crate::ntfs::structs::*;
 use crate::ntfs::winapi::*;
@@ -31,6 +32,7 @@ impl UsnEntry {
         FileEntry {
             record_number: self.record_number,
             parent_record_number: self.parent_record_number,
+            file_reference_number: self.file_reference_number,
             name: self.name.clone(),
             attributes: self.attributes,
             is_directory: self.is_directory,
@@ -128,6 +130,16 @@ impl UsnScanner {
                         attributes: record.file_attributes,
                         is_directory: (record.file_attributes & file_attributes::DIRECTORY) != 0,
                     };
+
+                    // Log USN entries for debugging (filtered by name pattern if set)
+                    logging::log_usn_entry(
+                        entry.record_number,
+                        entry.parent_record_number,
+                        entry.file_reference_number,
+                        &entry.name,
+                        entry.attributes,
+                        entry.is_directory,
+                    );
 
                     callback(entry);
                     count += 1;
