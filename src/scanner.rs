@@ -2,12 +2,14 @@
 //!
 //! Orchestrates the scanning process, combining USN enumeration
 //! with MFT parsing for complete and accurate results.
+//! Supports direct physical drive reading (bypasses NTFS driver) for maximum reliability.
 
 use crate::error::{Result, EmFitError};
 use crate::file_tree::{FileTree, TreeBuilder, TreeNode};
 use crate::logging;
 use crate::ntfs::{
-    open_volume, FileEntry, MftParser, NtfsVolumeData, UsnEntry, UsnMonitor, UsnScanner,
+    open_volume, FileEntry, MftParser, MftRecordFetcher, NtfsVolumeData,
+    UsnEntry, UsnMonitor, UsnScanner, VolumeIO, open_physical_drive_for_volume,
 };
 use crate::ntfs::winapi::get_ntfs_volume_data;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,6 +28,8 @@ pub struct ScanConfig {
     pub use_usn: bool,
     /// Scan using direct MFT reading
     pub use_mft: bool,
+    /// Use direct physical drive access (bypasses NTFS driver)
+    pub use_physical_drive: bool,
     /// Include hidden files
     pub include_hidden: bool,
     /// Include system files
@@ -43,6 +47,7 @@ impl Default for ScanConfig {
         Self {
             use_usn: false,
             use_mft: true,
+            use_physical_drive: true,
             include_hidden: true,
             include_system: true,
             calculate_sizes: true,
@@ -143,8 +148,8 @@ impl VolumeScanner {
         let start_time = Instant::now();
 
         logging::separator(&format!("SCAN START: Drive {}", self.drive_letter));
-        logging::info("SCANNER", &format!("Config: usn={}, mft={}, hidden={}, system={}",
-            self.config.use_usn, self.config.use_mft,
+        logging::info("SCANNER", &format!("Config: usn={}, mft={}, physical={}, hidden={}, system={}",
+            self.config.use_usn, self.config.use_mft, self.config.use_physical_drive,
             self.config.include_hidden, self.config.include_system));
 
         // Initialize progress bar
@@ -161,33 +166,88 @@ impl VolumeScanner {
             None
         };
 
-        // Phase 1: Open volume and get NTFS data
+        // Phase 1: Open I/O source — try physical drive first, fall back to volume
         if let Some(ref pb) = pb {
-            pb.set_message("Opening volume...");
+            if self.config.use_physical_drive {
+                pb.set_message("Opening physical drive...");
+            } else {
+                pb.set_message("Opening volume...");
+            }
         }
 
-        let handle = open_volume(self.drive_letter)?;
-        let volume_data = get_ntfs_volume_data(&handle)?;
+        let (io, is_physical) = if self.config.use_physical_drive {
+            match open_physical_drive_for_volume(self.drive_letter) {
+                Ok(io) => {
+                    logging::info("SCANNER", "Physical drive mode active)");
+                    if let Some(ref pb) = pb {
+                        pb.set_message("Physical drive mode active");
+                    }
+                    (io, true)
+                }
+                Err(e) => {
+                    logging::warn("SCANNER", &format!(
+                        "Physical drive access failed: {}. Falling back to volume mode.", e
+                    ));
+                    if let Some(ref pb) = pb {
+                        pb.set_message("Falling back to volume mode...");
+                    }
+                    let handle = open_volume(self.drive_letter)?;
+                    let volume_data = get_ntfs_volume_data(&handle)?;
+                    (VolumeIO::Volume { handle, volume_data }, false)
+                }
+            }
+        } else {
+            let handle = open_volume(self.drive_letter)?;
+            let volume_data = get_ntfs_volume_data(&handle)?;
+            (VolumeIO::Volume { handle, volume_data }, false)
+        };
+
+        let volume_data = io.volume_data().clone();
         self.volume_data = Some(volume_data.clone());
 
-        let estimated_records = volume_data.estimated_mft_records();
+        // Create MFT parser with the I/O source
+        let mut parser = MftParser::new(io)?;
+        parser.load_mft_extents(self.drive_letter)?;
+
+        // Update volume_data after extents are loaded (mft_valid_data_length may have been set)
+        let volume_data = parser.volume_data().clone();
+        self.volume_data = Some(volume_data.clone());
+
+        let estimated_records = parser.estimated_records();
         if let Some(ref pb) = pb {
             pb.set_length(estimated_records);
             pb.set_message(format!(
-                "Volume: {} ({} estimated records)",
-                self.drive_letter, estimated_records
+                "Volume: {} ({} estimated records, {})",
+                self.drive_letter, estimated_records,
+                if is_physical { "physical drive" } else { "volume handle" }
             ));
         }
 
-        // Phase 2: Try USN enumeration first (fast path)
-        // Use volume info for on-demand parent resolution in path building
+        // Create TreeBuilder with volume info
         let mut builder = TreeBuilder::with_volume_info(
             self.drive_letter,
             volume_data.bytes_per_file_record_segment,
         );
+
+        // Set up MftRecordFetcher for on-demand parent resolution
+        match MftRecordFetcher::new(
+            self.drive_letter,
+            volume_data.clone(),
+            parser.mft_extents(),
+            is_physical,
+        ) {
+            Ok(fetcher) => {
+                builder.set_record_fetcher(Arc::new(fetcher));
+            }
+            Err(e) => {
+                logging::warn("SCANNER", &format!("Failed to create MftRecordFetcher: {}", e));
+            }
+        }
+
+        // Phase 2: Try USN enumeration first (fast path) — only in volume mode
         let mut usn_success = false;
 
-        if self.config.use_usn {
+        if self.config.use_usn && !is_physical {
             if let Some(ref pb) = pb {
                 pb.set_message("Scanning via USN Journal...");
             }
@@ -219,13 +279,15 @@ impl VolumeScanner {
             if let Some(ref pb) = pb {
                 if usn_success {
                     pb.set_message("Reading MFT for file sizes...");
+                } else if is_physical {
+                    pb.set_message("Scanning via MFT (physical drive)...");
                 } else {
-                    pb.set_message("Scanning via MFT (USN unavailable)...");
+                    pb.set_message("Scanning via MFT...");
                 }
                 pb.set_position(0);
             }
 
-            self.scan_via_mft(&mut builder, pb.as_ref(), !usn_success)?;
+            self.scan_via_mft_with_parser(&mut parser, &mut builder, pb.as_ref())?;
             logging::info("SCANNER", "MFT phase complete");
         }
 
@@ -242,9 +304,10 @@ impl VolumeScanner {
         let tree = builder.build();
 
         logging::info("SCANNER", &format!(
-            "Scan complete: {} files, {} dirs, {:.2}s",
+            "Scan complete: {} files, {} dirs, {:.2}s ({})",
             tree.stats.total_files, tree.stats.total_directories,
-            start_time.elapsed().as_secs_f64()
+            start_time.elapsed().as_secs_f64(),
+            if is_physical { "physical drive" } else { "volume" }
         ));
 
         if let Some(ref pb) = pb {
@@ -302,19 +365,13 @@ impl VolumeScanner {
         Ok(count.load(Ordering::Relaxed))
     }
 
-    /// Scan using direct MFT reading
-    fn scan_via_mft(
+    /// Scan using direct MFT reading with a pre-created parser
+    fn scan_via_mft_with_parser(
         &self,
+        parser: &mut MftParser,
         builder: &mut TreeBuilder,
         pb: Option<&ProgressBar>,
-        full_scan: bool,
     ) -> Result<()> {
-        let handle = open_volume(self.drive_letter)?;
-        let volume_data = get_ntfs_volume_data(&handle)?;
-
-        let mut parser = MftParser::new(handle, volume_data)?;
-        parser.load_mft_extents(self.drive_letter)?;
-
         let total_records = parser.estimated_records();
         let batch_size = self.config.batch_size;
         let mut processed = 0u64;
@@ -329,11 +386,9 @@ impl VolumeScanner {
 
             match parser.read_records_batch(processed, batch_count) {
                 Ok(batch) => {
-                    // Use the new batch processing method that handles extension records efficiently
                     let batch_entries = parser.parse_batch_with_extensions(batch);
 
                     for entry in batch_entries {
-                        // Filter
                         if !self.config.include_hidden && entry.is_hidden() {
                             continue;
                         }
@@ -345,7 +400,6 @@ impl VolumeScanner {
                     }
                 }
                 Err(e) => {
-                    // Could log warning here
                     if !e.is_recoverable() {
                         break;
                     }

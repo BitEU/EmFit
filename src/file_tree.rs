@@ -13,6 +13,7 @@
 use crate::logging;
 use crate::ntfs::{FileEntry, UsnEntry};
 use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
+use crate::ntfs::physical::MftRecordFetcher;
 use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, open_volume_for_file_id, SafeHandle};
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -197,6 +198,8 @@ pub struct FileTree {
     pub stats: TreeStats,
     /// Bytes per MFT record (for on-demand parent resolution)
     bytes_per_record: u32,
+    /// MFT record fetcher for on-demand parent resolution (replaces FSCTL_GET_NTFS_FILE_RECORD)
+    record_fetcher: Option<Arc<MftRecordFetcher>>,
 }
 
 /// Statistics about the tree
@@ -221,6 +224,7 @@ impl FileTree {
             root_record: 5, // NTFS root is always record 5
             stats: TreeStats::default(),
             bytes_per_record: 1024, // Default MFT record size
+            record_fetcher: None,
         }
     }
 
@@ -234,7 +238,13 @@ impl FileTree {
             root_record: 5,
             stats: TreeStats::default(),
             bytes_per_record,
+            record_fetcher: None,
         }
+    }
+
+    /// Set the MFT record fetcher for on-demand parent resolution
+    pub fn set_record_fetcher(&mut self, fetcher: Arc<MftRecordFetcher>) {
+        self.record_fetcher = Some(fetcher);
     }
 
     /// Set bytes per record (for on-demand parent resolution)
@@ -392,7 +402,35 @@ impl FileTree {
                 if debug {
                     eprintln!("  [path] Record {} NOT in tree, attempting fetch...", current);
                 }
-                // Parent not in tree - try to fetch it on-demand
+
+                // Try MftRecordFetcher first (direct disk read, works in physical mode)
+                if let Some(ref fetcher) = self.record_fetcher {
+                    if debug {
+                        eprintln!("  [path] Using MftRecordFetcher for record {}", current);
+                    }
+                    if let Some((name, parent)) = fetcher.fetch_parent_info(current) {
+                        if debug {
+                            eprintln!("  [path] Fetcher got: name='{}', parent={}", name, parent);
+                        }
+                        let node = TreeNode {
+                            record_number: current,
+                            parent_record_number: parent,
+                            name: name.clone(),
+                            is_directory: true,
+                            ..Default::default()
+                        };
+                        self.insert(node);
+                        parts.push(name);
+                        current = parent;
+                        continue;
+                    }
+                    if debug {
+                        eprintln!("  [path] MftRecordFetcher returned None");
+                    }
+                    break;
+                }
+
+                // Fallback: use FSCTL_GET_NTFS_FILE_RECORD (volume mode only)
                 if volume_handle.is_none() {
                     match open_volume(self.drive_letter) {
                         Ok(h) => {
@@ -434,7 +472,6 @@ impl FileTree {
                                     if debug {
                                         eprintln!("  [path] Extracted: name='{}', parent={}", name, parent);
                                     }
-                                    // Cache this record for future lookups
                                     let node = TreeNode {
                                         record_number: current,
                                         parent_record_number: parent,
@@ -486,7 +523,35 @@ impl FileTree {
                 if debug {
                     eprintln!("  [path] Record {} NOT in tree, attempting fetch...", current);
                 }
-                // Parent not in tree - try to fetch it on-demand
+
+                // Try MftRecordFetcher first (direct disk read, works in physical mode)
+                if let Some(ref fetcher) = self.record_fetcher {
+                    if debug {
+                        eprintln!("  [path] Using MftRecordFetcher for record {}", current);
+                    }
+                    if let Some((name, parent)) = fetcher.fetch_parent_info(current) {
+                        if debug {
+                            eprintln!("  [path] Fetcher got: name='{}', parent={}", name, parent);
+                        }
+                        let node = TreeNode {
+                            record_number: current,
+                            parent_record_number: parent,
+                            name: name.clone(),
+                            is_directory: true,
+                            ..Default::default()
+                        };
+                        self.insert(node);
+                        parts.push(name);
+                        current = parent;
+                        continue;
+                    }
+                    if debug {
+                        eprintln!("  [path] MftRecordFetcher returned None");
+                    }
+                    break;
+                }
+
+                // Fallback: use FSCTL_GET_NTFS_FILE_RECORD (volume mode only)
                 if volume_handle.is_none() {
                     match open_volume(self.drive_letter) {
                         Ok(h) => {
@@ -527,7 +592,6 @@ impl FileTree {
                                     if debug {
                                         eprintln!("  [path] Extracted: name='{}', parent={}", name, parent);
                                     }
-                                    // Cache this record for future lookups
                                     let node = TreeNode {
                                         record_number: current,
                                         parent_record_number: parent,
@@ -820,6 +884,11 @@ impl TreeBuilder {
         Self {
             tree: FileTree::with_volume_info(drive_letter, bytes_per_record),
         }
+    }
+
+    /// Set the MFT record fetcher for on-demand parent resolution
+    pub fn set_record_fetcher(&mut self, fetcher: Arc<MftRecordFetcher>) {
+        self.tree.set_record_fetcher(fetcher);
     }
 
     /// Add entries from USN enumeration

@@ -34,6 +34,12 @@ pub enum EmFitError {
     #[error("USN Journal not active on volume '{0}'")]
     UsnJournalNotActive(String),
 
+    #[error("Physical drive error: {0}")]
+    PhysicalDriveError(String),
+
+    #[error("Not an NTFS boot sector")]
+    NotNtfsBootSector,
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 

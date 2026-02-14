@@ -1,6 +1,4 @@
 //! NTFS on-disk structures and constants
-//!
-//! Based on reverse engineering of WizTree and Everything, plus NTFS documentation.
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
@@ -166,6 +164,129 @@ impl NtfsVolumeData {
     /// Estimate total MFT records
     pub fn estimated_mft_records(&self) -> u64 {
         self.mft_valid_data_length / self.bytes_per_file_record_segment as u64
+    }
+}
+
+// ============================================================================
+// NTFS Boot Sector
+// ============================================================================
+
+/// Parsed NTFS boot sector (first 512 bytes of an NTFS partition)
+#[derive(Debug, Clone)]
+pub struct NtfsBootSector {
+    /// OEM ID - must be "NTFS    " (8 bytes at offset 0x03)
+    pub oem_id: [u8; 8],
+    /// Bytes per sector (offset 0x0B, typically 512)
+    pub bytes_per_sector: u16,
+    /// Sectors per cluster (offset 0x0D, typically 8 -> 4096 byte clusters)
+    pub sectors_per_cluster: u8,
+    /// Total sectors on volume (offset 0x28)
+    pub total_sectors: u64,
+    /// MFT starting cluster number / LCN (offset 0x30)
+    pub mft_cluster_number: u64,
+    /// MFT mirror starting cluster number (offset 0x38)
+    pub mft_mirror_cluster_number: u64,
+    /// Clusters per MFT record (offset 0x40, signed)
+    /// If negative, record size = 2^|value| bytes
+    /// If positive, record size = value * bytes_per_cluster
+    pub clusters_per_mft_record: i8,
+    /// Clusters per index block (offset 0x44, signed, same encoding)
+    pub clusters_per_index_block: i8,
+    /// Volume serial number (offset 0x48)
+    pub volume_serial_number: u64,
+}
+
+impl NtfsBootSector {
+    /// Parse from raw 512-byte boot sector data
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 0x50 {
+            return None;
+        }
+
+        let mut oem_id = [0u8; 8];
+        oem_id.copy_from_slice(&data[0x03..0x0B]);
+
+        let bytes_per_sector = u16::from_le_bytes([data[0x0B], data[0x0C]]);
+        let sectors_per_cluster = data[0x0D];
+        let total_sectors = u64::from_le_bytes([
+            data[0x28], data[0x29], data[0x2A], data[0x2B],
+            data[0x2C], data[0x2D], data[0x2E], data[0x2F],
+        ]);
+        let mft_cluster_number = u64::from_le_bytes([
+            data[0x30], data[0x31], data[0x32], data[0x33],
+            data[0x34], data[0x35], data[0x36], data[0x37],
+        ]);
+        let mft_mirror_cluster_number = u64::from_le_bytes([
+            data[0x38], data[0x39], data[0x3A], data[0x3B],
+            data[0x3C], data[0x3D], data[0x3E], data[0x3F],
+        ]);
+        let clusters_per_mft_record = data[0x40] as i8;
+        let clusters_per_index_block = data[0x44] as i8;
+        let volume_serial_number = u64::from_le_bytes([
+            data[0x48], data[0x49], data[0x4A], data[0x4B],
+            data[0x4C], data[0x4D], data[0x4E], data[0x4F],
+        ]);
+
+        Some(Self {
+            oem_id,
+            bytes_per_sector,
+            sectors_per_cluster,
+            total_sectors,
+            mft_cluster_number,
+            mft_mirror_cluster_number,
+            clusters_per_mft_record,
+            clusters_per_index_block,
+            volume_serial_number,
+        })
+    }
+
+    /// Validate this is an NTFS boot sector
+    pub fn is_valid_ntfs(&self) -> bool {
+        &self.oem_id == b"NTFS    "
+            && self.bytes_per_sector >= 256
+            && self.bytes_per_sector.is_power_of_two()
+            && self.sectors_per_cluster > 0
+            && self.sectors_per_cluster.is_power_of_two()
+    }
+
+    /// Calculate bytes per cluster
+    pub fn bytes_per_cluster(&self) -> u32 {
+        self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
+    }
+
+    /// Calculate bytes per MFT record
+    /// If clusters_per_mft_record is negative, size = 2^|value|
+    /// If positive, size = value * bytes_per_cluster
+    pub fn bytes_per_mft_record(&self) -> u32 {
+        if self.clusters_per_mft_record < 0 {
+            1u32 << (-self.clusters_per_mft_record as u32)
+        } else {
+            self.clusters_per_mft_record as u32 * self.bytes_per_cluster()
+        }
+    }
+
+    /// Convert to NtfsVolumeData for compatibility with existing MftParser code.
+    /// Note: mft_valid_data_length will be 0 — it must be filled in later
+    /// by parsing record 0's $DATA attribute.
+    pub fn to_volume_data(&self) -> NtfsVolumeData {
+        let bpc = self.bytes_per_cluster();
+        let bpr = self.bytes_per_mft_record();
+        NtfsVolumeData {
+            volume_serial_number: self.volume_serial_number,
+            number_sectors: self.total_sectors,
+            total_clusters: self.total_sectors / self.sectors_per_cluster as u64,
+            free_clusters: 0, // Not available from boot sector
+            total_reserved: 0,
+            bytes_per_sector: self.bytes_per_sector as u32,
+            bytes_per_cluster: bpc,
+            bytes_per_file_record_segment: bpr,
+            clusters_per_file_record_segment: if bpr >= bpc { bpr / bpc } else { 0 },
+            mft_valid_data_length: 0, // Must be filled from record 0's $DATA
+            mft_start_lcn: self.mft_cluster_number,
+            mft2_start_lcn: self.mft_mirror_cluster_number,
+            mft_zone_start: 0, // Not available from boot sector
+            mft_zone_end: 0,
+        }
     }
 }
 

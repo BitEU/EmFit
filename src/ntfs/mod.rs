@@ -7,15 +7,17 @@
 //! - Fixup verification for data integrity
 
 pub mod mft;
+pub mod physical;
 pub mod structs;
 pub mod usn;
 pub mod winapi;
 
 // Re-export commonly used types
 pub use mft::{FileEntry, HardLink, MftParser};
+pub use physical::{MftRecordFetcher, VolumeIO, open_physical_drive_for_volume};
 pub use structs::{
     AttributeType, DataRun, FileNameAttribute, FilenameNamespace, MftRecordHeader,
-    NtfsVolumeData, StandardInformation, UsnJournalData, UsnRecord,
+    NtfsBootSector, NtfsVolumeData, StandardInformation, UsnJournalData, UsnRecord,
 };
 pub use usn::{ChangeEvent, ChangeReason, HybridScanner, UsnEntry, UsnMonitor, UsnScanner};
 pub use winapi::{

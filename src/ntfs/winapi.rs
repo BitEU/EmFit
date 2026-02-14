@@ -9,7 +9,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 
 // ============================================================================
-// IOCTL Control Codes (from winioctl.h and our reverse engineering)
+// IOCTL Control Codes
 // ============================================================================
 
 // Standard NTFS IOCTLs
@@ -25,6 +25,9 @@ pub const FSCTL_CREATE_USN_JOURNAL: u32 = 0x000900E7;
 
 // Disk geometry
 pub const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x00070000;
+
+// Volume management (not NTFS-specific)
+pub const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x00560000;
 
 // File attributes for CreateFile
 pub const GENERIC_READ: u32 = 0x80000000;
@@ -356,6 +359,73 @@ pub fn read_volume_at(handle: &SafeHandle, offset: u64, buffer: &mut [u8]) -> Re
     } else {
         Err(EmFitError::IoError(std::io::Error::last_os_error()))
     }
+}
+
+// ============================================================================
+// Physical Drive Access
+// ============================================================================
+
+/// Physical disk extent for a volume: which physical drive and offset
+#[derive(Debug, Clone)]
+pub struct VolumeDiskExtent {
+    pub disk_number: u32,
+    pub starting_offset: u64,
+    pub extent_length: u64,
+}
+
+/// Get the physical disk location for a volume.
+/// Uses IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS to map a volume handle
+/// to a physical drive number and byte offset.
+pub fn get_volume_disk_extents(handle: &SafeHandle) -> Result<VolumeDiskExtent> {
+    // VOLUME_DISK_EXTENTS: 4 bytes (count) + 4 padding + DISK_EXTENT[1]
+    // DISK_EXTENT: 4 bytes (DiskNumber) + 4 padding + 8 (StartingOffset) + 8 (ExtentLength) = 24 bytes
+    // Total: 32 bytes for single extent
+    let mut buffer = [0u8; 32];
+
+    let bytes_returned = device_io_control(
+        handle,
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+        None,
+        &mut buffer,
+    )?;
+
+    if bytes_returned < 32 {
+        return Err(EmFitError::WindowsError(
+            "IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS returned too few bytes".to_string(),
+        ));
+    }
+
+    let extent_count = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
+    if extent_count == 0 {
+        return Err(EmFitError::WindowsError(
+            "Volume has no disk extents".to_string(),
+        ));
+    }
+
+    if extent_count > 1 {
+        return Err(EmFitError::WindowsError(format!(
+            "Volume spans {} disk extents (spanned/striped volumes not supported for physical drive mode)",
+            extent_count
+        )));
+    }
+
+    // Parse first DISK_EXTENT at offset 8 (after count + padding)
+    let disk_number = u32::from_le_bytes(buffer[8..12].try_into().unwrap());
+    // 4 bytes padding at [12..16]
+    let starting_offset = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
+    let extent_length = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+
+    Ok(VolumeDiskExtent {
+        disk_number,
+        starting_offset,
+        extent_length,
+    })
+}
+
+/// Open a physical drive for direct raw read access
+pub fn open_physical_drive(disk_number: u32) -> Result<SafeHandle> {
+    let path = format!("\\\\.\\PhysicalDrive{}", disk_number);
+    open_volume_path(&path)
 }
 
 // ============================================================================

@@ -128,9 +128,9 @@ impl FileEntry {
 
 /// MFT Parser handles reading and decoding MFT records
 pub struct MftParser {
-    /// Volume handle
-    handle: SafeHandle,
-    /// NTFS volume data
+    /// I/O source (volume handle or physical drive)
+    io: crate::ntfs::physical::VolumeIO,
+    /// NTFS volume data (cached copy for quick access)
     volume_data: NtfsVolumeData,
     /// MFT extents (for fragmented MFT)
     mft_extents: Vec<Extent>,
@@ -139,14 +139,15 @@ pub struct MftParser {
 }
 
 impl MftParser {
-    /// Create a new MFT parser for a volume
-    pub fn new(handle: SafeHandle, volume_data: NtfsVolumeData) -> Result<Self> {
+    /// Create a new MFT parser from a VolumeIO source
+    pub fn new(io: crate::ntfs::physical::VolumeIO) -> Result<Self> {
+        let volume_data = io.volume_data().clone();
         // Allocate aligned buffer for reading
         let buffer_size = (volume_data.bytes_per_file_record_segment * 16) as usize;
         let read_buffer = vec![0u8; buffer_size];
 
         Ok(Self {
-            handle,
+            io,
             volume_data,
             mft_extents: Vec::new(),
             read_buffer,
@@ -163,8 +164,16 @@ impl MftParser {
         &self.mft_extents
     }
 
-    /// Get MFT extents by opening $MFT directly
+    /// Get MFT extents.
+    /// In physical drive mode, always parses record 0 directly (no NTFS driver IOCTLs).
+    /// In volume mode, tries opening $MFT first, then falls back to record 0 parsing.
     pub fn load_mft_extents(&mut self, drive_letter: char) -> Result<()> {
+        if self.io.is_physical() {
+            // Physical drive mode: parse record 0's data runs directly
+            return self.load_mft_extents_from_record_zero();
+        }
+
+        // Volume mode: try FSCTL_GET_RETRIEVAL_POINTERS first
         let mft_path = format!("{}:\\$MFT", drive_letter);
 
         match open_file_read(&mft_path) {
@@ -187,9 +196,9 @@ impl MftParser {
         // from the volume data's MftStartLcn
         let record_size = self.volume_data.bytes_per_file_record_segment as usize;
         let mft_start = self.volume_data.mft_byte_offset();
-        
+
         let mut buffer = vec![0u8; record_size];
-        let bytes_read = read_volume_at(&self.handle, mft_start, &mut buffer)?;
+        let bytes_read = self.io.read_at(mft_start, &mut buffer)?;
         
         if bytes_read < record_size {
             return Ok(()); // Fallback: no extents, use linear calculation
@@ -228,6 +237,19 @@ impl MftParser {
                 let attr_data = &buffer[offset..offset + attr_header.length as usize];
                 
                 if let Some(nr_header) = NonResidentAttributeHeader::from_bytes(attr_data) {
+                    // Extract mft_valid_data_length from the $DATA attribute's data_size
+                    // This is critical for physical drive mode where we don't have
+                    // FSCTL_GET_NTFS_VOLUME_DATA to provide this value
+                    if self.volume_data.mft_valid_data_length == 0 && nr_header.data_size > 0 {
+                        self.volume_data.mft_valid_data_length = nr_header.data_size;
+                        self.io.volume_data_mut().mft_valid_data_length = nr_header.data_size;
+                        logging::info("MFT", &format!(
+                            "Extracted mft_valid_data_length from record 0: {} ({} records)",
+                            nr_header.data_size,
+                            nr_header.data_size / self.volume_data.bytes_per_file_record_segment as u64,
+                        ));
+                    }
+
                     let runs_offset = nr_header.data_runs_offset as usize;
                     if runs_offset < attr_data.len() {
                         let (runs, _) = DataRun::decode_runs(&attr_data[runs_offset..]);
@@ -252,7 +274,7 @@ impl MftParser {
 
                             current_vcn += run.cluster_count;
                         }
-                        
+
                         break;
                     }
                 }
@@ -270,7 +292,7 @@ impl MftParser {
         let mut buffer = vec![0u8; record_size];
 
         let offset = self.calculate_record_offset(record_number);
-        let bytes_read = read_volume_at(&self.handle, offset, &mut buffer)?;
+        let bytes_read = self.io.read_at(offset, &mut buffer)?;
 
         if bytes_read < record_size {
             return Err(EmFitError::MftReadError(format!(
@@ -972,6 +994,16 @@ impl MftParser {
     pub fn estimated_records(&self) -> u64 {
         self.volume_data.estimated_mft_records()
     }
+
+    /// Get MFT extents (cloned, for creating MftRecordFetcher)
+    pub fn mft_extents(&self) -> Vec<Extent> {
+        self.mft_extents.clone()
+    }
+
+    /// Check if the parser is using physical drive mode
+    pub fn is_physical(&self) -> bool {
+        self.io.is_physical()
+    }
 }
 
 // ============================================================================
@@ -994,7 +1026,7 @@ impl MftParser {
         }
 
         let offset = self.calculate_record_offset(start_record);
-        let bytes_read = read_volume_at(&self.handle, offset, &mut self.read_buffer[..total_size])?;
+        let bytes_read = self.io.read_at(offset, &mut self.read_buffer[..total_size])?;
 
         let records_read = bytes_read / record_size;
         let mut results = Vec::with_capacity(records_read);
@@ -1318,7 +1350,7 @@ fn extract_parent_info_internal(data: &[u8], debug: bool) -> Option<(String, u64
 }
 
 /// Apply fixup array to MFT record data (standalone version)
-fn apply_fixup_standalone(data: &mut [u8], header: &MftRecordHeader) -> Result<()> {
+pub fn apply_fixup_standalone(data: &mut [u8], header: &MftRecordHeader) -> Result<()> {
     let fixup_offset = header.update_sequence_offset as usize;
     let fixup_count = header.update_sequence_size as usize;
 

@@ -152,7 +152,7 @@ impl EmFitApp {
                     include_system: true,
                     calculate_sizes: true, // Must be true to get file sizes from MFT
                     show_progress: false,
-                    batch_size: 1024,
+                    ..Default::default()
                 };
 
                 let mut scanner = VolumeScanner::new(drive).with_config(config);

@@ -43,6 +43,12 @@ enum Commands {
         #[arg(long, default_value = "true")]
         mft: bool,
 
+        /// Disable direct physical drive access
+        /// By default, EmFit reads from the physical drive directly.
+        /// Use this flag to fall back to volume handle mode.
+        #[arg(long)]
+        no_physical: bool,
+
         /// Include hidden files
         #[arg(long, default_value = "true")]
         hidden: bool,
@@ -167,10 +173,11 @@ fn main() {
             drive,
             usn,
             mft,
+            no_physical,
             hidden,
             system,
             output,
-        } => cmd_scan(drive, usn, mft, hidden, system, &output),
+        } => cmd_scan(drive, usn, mft, !no_physical, hidden, system, &output),
 
         Commands::Search { drive, pattern, max } => cmd_search(drive, &pattern, max),
 
@@ -206,6 +213,7 @@ fn cmd_scan(
     drive: char,
     use_usn: bool,
     use_mft: bool,
+    use_physical_drive: bool,
     include_hidden: bool,
     include_system: bool,
     output_format: &str,
@@ -214,14 +222,16 @@ fn cmd_scan(
     let start = Instant::now();
 
     println!(
-        "{} Scanning drive {}:",
+        "{} Scanning drive {}:{}",
         style("→").cyan().bold(),
-        style(format!("{}:", drive.to_ascii_uppercase())).yellow()
+        style(format!("{}:", drive.to_ascii_uppercase())).yellow(),
+        if use_physical_drive { " (physical drive mode)" } else { "" }
     );
 
     let config = ScanConfig {
         use_usn,
         use_mft,
+        use_physical_drive,
         include_hidden,
         include_system,
         calculate_sizes: true,
@@ -768,7 +778,7 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
 
 /// Read a specific MFT record directly
 fn cmd_read_mft(drive: char, record_num: u64) -> emfit::Result<()> {
-    use emfit::ntfs::{open_volume, MftParser};
+    use emfit::ntfs::{open_volume, MftParser, VolumeIO, open_physical_drive_for_volume};
     use emfit::ntfs::winapi::get_ntfs_volume_data;
 
     println!(
@@ -778,16 +788,29 @@ fn cmd_read_mft(drive: char, record_num: u64) -> emfit::Result<()> {
         drive.to_ascii_uppercase()
     );
 
-    let handle = open_volume(drive)?;
-    let volume_data = get_ntfs_volume_data(&handle)?;
-    
+    // Try physical drive first, fall back to volume
+    let io = match open_physical_drive_for_volume(drive) {
+        Ok(io) => {
+            println!("  Mode: Physical drive (direct hardware access)");
+            io
+        }
+        Err(_) => {
+            let handle = open_volume(drive)?;
+            let volume_data = get_ntfs_volume_data(&handle)?;
+            println!("  Mode: Volume handle");
+            VolumeIO::Volume { handle, volume_data }
+        }
+    };
+
+    let volume_data = io.volume_data().clone();
+
     println!("  Volume data:");
     println!("    Bytes per sector: {}", volume_data.bytes_per_sector);
     println!("    Bytes per cluster: {}", volume_data.bytes_per_cluster);
     println!("    Bytes per MFT record: {}", volume_data.bytes_per_file_record_segment);
     println!("    Total MFT records (est): {}", volume_data.estimated_mft_records());
 
-    let mut parser = MftParser::new(handle, volume_data.clone())?;
+    let mut parser = MftParser::new(io)?;
     parser.load_mft_extents(drive)?;
 
     let extents = parser.extents();
