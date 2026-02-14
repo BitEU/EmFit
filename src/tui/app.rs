@@ -4,7 +4,7 @@ use crate::tui::search::{matches_pattern, SearchState};
 use crate::tui::table::{SortColumn, SortOrder, TableState};
 use crate::tui::ui;
 use crate::{FileTree, MultiVolumeScanner, ScanConfig, VolumeScanner};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -123,7 +123,10 @@ impl App {
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if event::poll(timeout).unwrap_or(false) {
                 if let Ok(Event::Key(key)) = event::read() {
-                    self.handle_key(key);
+                    // Only handle key press events, ignore key release and repeat
+                    if key.kind == KeyEventKind::Press {
+                        self.handle_key(key);
+                    }
                 }
             }
 
