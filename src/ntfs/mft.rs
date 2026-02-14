@@ -700,7 +700,8 @@ impl MftParser {
         let mut offset = header.first_attribute_offset as usize;
 
         // Track best filename (prefer Win32 namespace) for the primary name/parent
-        let mut best_filename: Option<(FilenameNamespace, String, u64)> = None;
+        // Tuple: (namespace, name, parent, creation_time, modification_time)
+        let mut best_filename: Option<(FilenameNamespace, String, u64, u64, u64)> = None;
 
         // Collect ALL $FILE_NAME attributes for hard link support
         // Each $FILE_NAME can have a different parent directory (hard link)
@@ -731,7 +732,7 @@ impl MftParser {
                     self.parse_standard_information(attr_data, entry)?;
                 }
                 Some(AttributeType::FileName) => {
-                    if let Some((ns, name, parent)) = self.parse_filename(attr_data)? {
+                    if let Some((ns, name, parent, ctime, mtime)) = self.parse_filename(attr_data)? {
                         // Skip DOS-only names (like Everything does)
                         // DOS names are short 8.3 aliases, not real hard links
                         if ns != FilenameNamespace::Dos {
@@ -742,18 +743,18 @@ impl MftParser {
                         // Keep best filename for primary entry (Win32 > Win32+DOS > POSIX > DOS)
                         let dominated = match (&best_filename, ns) {
                             (None, _) => true,
-                            (Some((FilenameNamespace::Dos, _, _)), _) => ns != FilenameNamespace::Dos,
-                            (Some((FilenameNamespace::Posix, _, _)), ns) => {
+                            (Some((FilenameNamespace::Dos, _, ..)), _) => ns != FilenameNamespace::Dos,
+                            (Some((FilenameNamespace::Posix, _, ..)), ns) => {
                                 ns == FilenameNamespace::Win32 || ns == FilenameNamespace::Win32AndDos
                             }
-                            (Some((FilenameNamespace::Win32AndDos, _, _)), ns) => {
+                            (Some((FilenameNamespace::Win32AndDos, _, ..)), ns) => {
                                 ns == FilenameNamespace::Win32
                             }
-                            (Some((FilenameNamespace::Win32, _, _)), _) => false,
+                            (Some((FilenameNamespace::Win32, _, ..)), _) => false,
                         };
 
                         if dominated {
-                            best_filename = Some((ns, name, parent));
+                            best_filename = Some((ns, name, parent, ctime, mtime));
                         }
                     }
                 }
@@ -777,9 +778,19 @@ impl MftParser {
         }
 
         // Set primary filename and parent from best match
-        if let Some((_, name, parent)) = best_filename {
+        if let Some((_, name, parent, fn_ctime, fn_mtime)) = best_filename {
             entry.name = name;
             entry.parent_record_number = parent;
+
+            // Fallback: if $STANDARD_INFORMATION timestamps are missing (0),
+            // use $FILE_NAME timestamps instead. This handles cases where
+            // $STANDARD_INFORMATION is corrupt or missing.
+            if entry.creation_time == 0 && fn_ctime != 0 {
+                entry.creation_time = fn_ctime;
+            }
+            if entry.modification_time == 0 && fn_mtime != 0 {
+                entry.modification_time = fn_mtime;
+            }
         }
 
         // Convert all filenames to HardLink entries
@@ -892,10 +903,11 @@ impl MftParser {
     }
 
     /// Parse $FILE_NAME attribute
+    /// Returns (namespace, name, parent_record_number, creation_time, modification_time)
     fn parse_filename(
         &self,
         attr_data: &[u8],
-    ) -> Result<Option<(FilenameNamespace, String, u64)>> {
+    ) -> Result<Option<(FilenameNamespace, String, u64, u64, u64)>> {
         let header = ResidentAttributeHeader::from_bytes(attr_data);
 
         if let Some(h) = header {
@@ -907,7 +919,13 @@ impl MftParser {
 
                 if let Some(fn_attr) = FileNameAttribute::from_bytes(content) {
                     let parent_ref = fn_attr.parent_record_number();
-                    return Ok(Some((fn_attr.namespace, fn_attr.name, parent_ref)));
+                    return Ok(Some((
+                        fn_attr.namespace,
+                        fn_attr.name,
+                        parent_ref,
+                        fn_attr.creation_time,
+                        fn_attr.modification_time,
+                    )));
                 }
             }
         }

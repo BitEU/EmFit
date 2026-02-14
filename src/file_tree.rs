@@ -137,8 +137,14 @@ impl TreeNode {
         self.allocated_size = entry.allocated_size;
         self.total_size = entry.file_size;
         self.total_allocated = entry.allocated_size;
-        self.creation_time = entry.creation_time;
-        self.modification_time = entry.modification_time;
+        // Don't overwrite existing timestamps with 0 (e.g., if MFT
+        // failed to parse $STANDARD_INFORMATION for this record)
+        if entry.creation_time != 0 {
+            self.creation_time = entry.creation_time;
+        }
+        if entry.modification_time != 0 {
+            self.modification_time = entry.modification_time;
+        }
         // Update file_reference_number if MFT provides a valid one
         // (MFT's FRN includes sequence number which is more accurate)
         if entry.file_reference_number != 0 {
@@ -1021,8 +1027,12 @@ impl TreeBuilder {
                         node.allocated_size = entry.allocated_size;
                         node.total_size = entry.file_size;
                         node.total_allocated = entry.allocated_size;
-                        node.creation_time = entry.creation_time;
-                        node.modification_time = entry.modification_time;
+                        if entry.creation_time != 0 {
+                            node.creation_time = entry.creation_time;
+                        }
+                        if entry.modification_time != 0 {
+                            node.modification_time = entry.modification_time;
+                        }
                         if entry.file_reference_number != 0 {
                             node.file_reference_number = entry.file_reference_number;
                         }
