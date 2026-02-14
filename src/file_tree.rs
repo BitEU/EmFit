@@ -713,11 +713,6 @@ impl FileTree {
 
         // Fetch metadata for each file using full FRN
         for &(key, file_ref) in entries {
-            // Skip system MFT records (0-15 are reserved)
-            if key.record_number < 16 {
-                continue;
-            }
-
             // Skip if we already refreshed this record (via a different hardlink)
             if refreshed_records.contains(&key.record_number) {
                 // Still return the result for the caller's key

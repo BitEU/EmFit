@@ -41,7 +41,7 @@ pub struct ScanConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            use_usn: true,
+            use_usn: false,
             use_mft: true,
             include_hidden: true,
             include_system: true,

@@ -35,8 +35,8 @@ enum Commands {
         #[arg(short, long)]
         drive: char,
 
-        /// Use USN Journal for fast enumeration
-        #[arg(long, default_value = "true")]
+        /// Use USN Journal for fast enumeration (default: false, uses MFT for accuracy)
+        #[arg(long, default_value = "false")]
         usn: bool,
 
         /// Use direct MFT reading for accurate sizes
@@ -303,10 +303,10 @@ fn cmd_search(drive: char, pattern: &str, max_results: usize) -> emfit::Result<(
 
     let start = Instant::now();
 
-    // Use all available data sources for complete results
+    // Use MFT for complete file enumeration including hard links
     let config = ScanConfig {
-        use_usn: true,
-        use_mft: true, // Always use MFT for complete file enumeration
+        use_usn: false,
+        use_mft: true,
         calculate_sizes: false, // Skip size calculation for search speed
         show_progress: true,
         ..Default::default()
@@ -611,7 +611,7 @@ fn cmd_debug(drive: char, pattern: &str) -> emfit::Result<()> {
     );
 
     let config = ScanConfig {
-        use_usn: true,
+        use_usn: false,
         use_mft: true,
         calculate_sizes: false,
         show_progress: true,

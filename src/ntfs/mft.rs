@@ -491,6 +491,77 @@ impl MftParser {
         best_name.map(|(name, parent, _)| (name, parent))
     }
 
+    /// Extract ALL $FILE_NAME attributes from an extension MFT record.
+    ///
+    /// Unlike `extract_filename_from_extension` which returns only the "best" name,
+    /// this returns every non-DOS filename as a HardLink. This is critical for
+    /// discovering hard links whose $FILE_NAME attributes spilled into extension records.
+    fn extract_all_filenames_from_extension(&self, data: &mut [u8]) -> Vec<HardLink> {
+        let mut links = Vec::new();
+
+        // Parse header
+        let header = match MftRecordHeader::from_bytes(data) {
+            Some(h) => h,
+            None => return links,
+        };
+
+        if !header.is_valid() {
+            return links;
+        }
+
+        // Apply fixup
+        if self.apply_fixup(0, data, &header).is_err() {
+            return links;
+        }
+
+        let record_size = self.volume_data.bytes_per_file_record_segment as usize;
+        let mut offset = header.first_attribute_offset as usize;
+
+        while offset + 16 <= record_size && offset + 16 <= data.len() {
+            let attr_header = match AttributeHeader::from_bytes(&data[offset..]) {
+                Some(h) => h,
+                None => break,
+            };
+
+            if attr_header.attribute_type == ATTRIBUTE_END_MARKER || attr_header.length == 0 {
+                break;
+            }
+
+            if offset + attr_header.length as usize > data.len() {
+                break;
+            }
+
+            // Look for FILE_NAME attribute (type 0x30)
+            if attr_header.attribute_type == 0x30 && !attr_header.non_resident {
+                let attr_data = &data[offset..offset + attr_header.length as usize];
+
+                if let Some(res_header) = ResidentAttributeHeader::from_bytes(attr_data) {
+                    let content_offset = res_header.value_offset as usize;
+                    let content_len = res_header.value_length as usize;
+
+                    if content_offset + content_len <= attr_data.len() {
+                        let content = &attr_data[content_offset..content_offset + content_len];
+
+                        if let Some(fn_attr) = FileNameAttribute::from_bytes(content) {
+                            // Skip DOS-only names (short 8.3 aliases, not real hard links)
+                            if fn_attr.namespace != FilenameNamespace::Dos {
+                                links.push(HardLink {
+                                    parent_record_number: fn_attr.parent_record_number(),
+                                    name: fn_attr.name.clone(),
+                                    namespace: fn_attr.namespace,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            offset += attr_header.length as usize;
+        }
+
+        links
+    }
+
     /// Extract file size from an extension MFT record containing $DATA attribute
     ///
     /// Returns (file_size, allocated_size) if found
@@ -950,6 +1021,7 @@ impl MftParser {
     ) -> Vec<FileEntry> {
         let mut entries: Vec<FileEntry> = Vec::with_capacity(batch.len());
         let mut needs_name_extension: Vec<usize> = Vec::new(); // Indices into entries that need name resolution
+        let mut needs_hardlink_extension: Vec<usize> = Vec::new(); // Indices that have extension records with potential additional hard links
         let mut needs_data_extension: Vec<usize> = Vec::new(); // Indices into entries that need size resolution
         let mut extension_record_set: HashSet<u64> = HashSet::new(); // All extension records we need to read
 
@@ -960,14 +1032,22 @@ impl MftParser {
                     if entry.is_valid {
                         let idx = entries.len();
 
-                        // Check if this entry needs $FILE_NAME extension record resolution
-                        if entry.name.is_empty() && !entry.extension_records.is_empty() {
+                        if !entry.extension_records.is_empty() {
+                            // Always collect extension records that contain $FILE_NAME attributes
+                            // These may hold additional hard links even if the base record already has a name
                             for ext_rec in &entry.extension_records {
                                 if *ext_rec != record_num {
                                     extension_record_set.insert(*ext_rec);
                                 }
                             }
-                            needs_name_extension.push(idx);
+
+                            if entry.name.is_empty() {
+                                // Entry has no name at all - needs primary name resolution
+                                needs_name_extension.push(idx);
+                            } else {
+                                // Entry already has a name but may have additional hard links in extension records
+                                needs_hardlink_extension.push(idx);
+                            }
                         }
 
                         // Check if this entry needs $DATA extension record resolution
@@ -992,7 +1072,7 @@ impl MftParser {
         }
 
         // If no entries need extension resolution, we're done
-        if needs_name_extension.is_empty() && needs_data_extension.is_empty() {
+        if needs_name_extension.is_empty() && needs_hardlink_extension.is_empty() && needs_data_extension.is_empty() {
             return entries;
         }
 
@@ -1001,22 +1081,34 @@ impl MftParser {
         let mut extension_records: Vec<u64> = extension_record_set.into_iter().collect();
         extension_records.sort_unstable();
 
-        // Read extension records and extract filenames and sizes
+        // Read extension records and extract filenames, hard links, and sizes
         let mut extension_names: HashMap<u64, (String, u64)> = HashMap::new();
+        let mut extension_hardlinks: HashMap<u64, Vec<HardLink>> = HashMap::new();
         let mut extension_sizes: HashMap<u64, (u64, u64)> = HashMap::new(); // record -> (file_size, allocated_size)
 
         for ext_record_num in extension_records {
             match self.read_record(ext_record_num) {
                 Ok(mut ext_data) => {
-                    // Extract filename if available
-                    if let Some((name, parent)) = self.extract_filename_from_extension(&mut ext_data) {
-                        if !name.is_empty() {
-                            extension_names.insert(ext_record_num, (name, parent));
+                    // Extract ALL filenames for hard link discovery
+                    let all_links = self.extract_all_filenames_from_extension(&mut ext_data);
+                    if !all_links.is_empty() {
+                        // Also set the "best" name for primary name resolution
+                        // (use the first non-DOS link as fallback)
+                        if !extension_names.contains_key(&ext_record_num) {
+                            let best = &all_links[0];
+                            extension_names.insert(ext_record_num, (best.name.clone(), best.parent_record_number));
                         }
+                        extension_hardlinks.insert(ext_record_num, all_links);
                     }
                     // Extract file size if available
-                    if let Some((file_size, allocated_size)) = self.extract_size_from_extension(&mut ext_data) {
-                        extension_sizes.insert(ext_record_num, (file_size, allocated_size));
+                    // Note: need to re-read since extract_all_filenames_from_extension consumed the fixup
+                    match self.read_record(ext_record_num) {
+                        Ok(mut ext_data2) => {
+                            if let Some((file_size, allocated_size)) = self.extract_size_from_extension(&mut ext_data2) {
+                                extension_sizes.insert(ext_record_num, (file_size, allocated_size));
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
                 Err(_) => {
@@ -1037,12 +1129,37 @@ impl MftParser {
                     if entry.parent_record_number == 0 {
                         entry.parent_record_number = *parent;
                     }
-                    break; // Found a name, we're done with this entry
+                    // Also add all hard links from extension records
+                    if let Some(links) = extension_hardlinks.get(ext_rec) {
+                        for link in links {
+                            // Avoid duplicates
+                            if !entry.hard_links.iter().any(|hl| hl.parent_record_number == link.parent_record_number && hl.name == link.name) {
+                                entry.hard_links.push(link.clone());
+                            }
+                        }
+                    }
+                    break; // Found a name, we're done with primary name
                 }
             }
         }
 
-        // Fourth pass: Apply extension record sizes to entries that need them
+        // Fourth pass: Apply additional hard links from extension records to entries that already have a name
+        for idx in needs_hardlink_extension {
+            let entry = &mut entries[idx];
+
+            for ext_rec in &entry.extension_records.clone() {
+                if let Some(links) = extension_hardlinks.get(ext_rec) {
+                    for link in links {
+                        // Avoid duplicates with existing hard links
+                        if !entry.hard_links.iter().any(|hl| hl.parent_record_number == link.parent_record_number && hl.name == link.name) {
+                            entry.hard_links.push(link.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fifth pass: Apply extension record sizes to entries that need them
         for idx in needs_data_extension {
             let entry = &mut entries[idx];
 

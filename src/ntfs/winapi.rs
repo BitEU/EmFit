@@ -732,11 +732,6 @@ pub fn batch_get_file_metadata(
     let mut results = std::collections::HashMap::with_capacity(file_ids.len());
 
     for &file_id in file_ids {
-        // Skip system MFT records (0-15 are reserved)
-        if file_id < 16 {
-            continue;
-        }
-
         if let Ok(metadata) = get_file_metadata_by_id(volume_handle, file_id) {
             results.insert(file_id, metadata);
         }
