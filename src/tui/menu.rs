@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 pub enum ActionKind {
     Open,
     OpenInExplorer,
+    Properties,
     Delete,
     Rename,
     CopyPath,
@@ -24,6 +25,7 @@ impl ActionsMenu {
             items: vec![
                 ("Open", ActionKind::Open),
                 ("Open in Explorer", ActionKind::OpenInExplorer),
+                ("Properties", ActionKind::Properties),
                 ("Delete", ActionKind::Delete),
                 ("Rename", ActionKind::Rename),
                 ("Copy Path", ActionKind::CopyPath),
@@ -309,6 +311,18 @@ impl SearchFiltersMenu {
     }
 }
 
+/// Info dialog for displaying multi-line information
+pub struct InfoDialog {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+impl InfoDialog {
+    pub fn new(title: String, lines: Vec<String>) -> Self {
+        Self { title, lines }
+    }
+}
+
 /// Which menu/dialog is currently active
 pub enum ActiveMenu {
     None,
@@ -316,6 +330,7 @@ pub enum ActiveMenu {
     Confirm(ConfirmDialog),
     Rename(RenameDialog),
     SearchFilters(SearchFiltersMenu),
+    Info(InfoDialog),
 }
 
 /// Copy text to clipboard using clip.exe on Windows
@@ -341,12 +356,47 @@ pub fn open_file(path: &str) {
 
 /// Open Windows Explorer with the file selected
 pub fn open_in_explorer(path: &str) {
-    // explorer /select, requires the path passed as a single argument with the comma
-    // Using cmd /c to avoid argument quoting issues
-    let _ = Command::new("cmd")
-        .args(["/c", &format!("explorer /select,\"{}\"", path)])
+    // Use raw_arg to avoid Rust's automatic argument quoting, which breaks
+    // paths containing spaces or special characters like parentheses.
+    // explorer.exe expects: /select,"C:\path with spaces\file"
+    let _ = Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{}\"", path))
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn();
+}
+
+/// Show Windows file properties dialog
+pub fn show_properties(path: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_INVOKEIDLIST};
+    use windows::Win32::Foundation::HWND;
+    use windows::core::PCWSTR;
+
+    let verb: Vec<u16> = OsStr::new("properties")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let file: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR::null(),
+        lpDirectory: PCWSTR::null(),
+        nShow: 5, // SW_SHOW
+        ..Default::default()
+    };
+
+    unsafe {
+        let _ = ShellExecuteExW(&mut sei);
+    }
 }
 
 /// Parse a size string like "10 MB", "500 KB", "1 GB" into bytes

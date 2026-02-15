@@ -3,6 +3,7 @@ pub mod colors;
 pub mod menu;
 pub mod search;
 pub mod table;
+pub mod treemap;
 pub mod ui;
 
 use crossterm::{
@@ -15,6 +16,12 @@ use std::io;
 
 /// Entry point: set up terminal, run event loop, restore terminal on exit
 pub fn run() -> crate::Result<()> {
+    // Set console to UTF-8 for proper unicode character display
+    unsafe {
+        let _ = windows::Win32::System::Console::SetConsoleOutputCP(65001);
+        let _ = windows::Win32::System::Console::SetConsoleCP(65001);
+    }
+
     // Install panic hook to restore terminal on crash
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

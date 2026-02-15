@@ -1,4 +1,4 @@
-use crate::tui::app::App;
+use crate::tui::app::{App, MenuBarState};
 use crate::tui::colors;
 use crate::tui::menu::{ActiveMenu, SearchFilterField};
 use crate::tui::table::SortColumn;
@@ -8,18 +8,26 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // If treemap is active, draw treemap view instead
+    if let Some(ref treemap) = app.treemap {
+        crate::tui::treemap::draw_treemap(frame, treemap, area);
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // Menu bar
             Constraint::Length(3), // Search bar
             Constraint::Min(5),   // Table
             Constraint::Length(1), // Status bar
         ])
         .split(area);
 
-    draw_search_bar(frame, app, chunks[0]);
-    draw_table(frame, app, chunks[1]);
-    draw_status_bar(frame, app, chunks[2]);
+    draw_menu_bar_strip(frame, app, chunks[0]);
+    draw_search_bar(frame, app, chunks[1]);
+    draw_table(frame, app, chunks[2]);
+    draw_status_bar(frame, app, chunks[3]);
 
     // Draw menu overlays
     match &app.active_menu {
@@ -36,14 +44,124 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ActiveMenu::SearchFilters(filters) => {
             draw_search_filters(frame, filters, area);
         }
+        ActiveMenu::Info(info) => {
+            draw_info_dialog(frame, info, area);
+        }
+    }
+
+    // Draw menu bar dropdown if open
+    if let Some(ref menu_bar) = app.menu_bar {
+        draw_menu_bar_dropdown(frame, menu_bar, area);
     }
 
     // Show cursor in search bar when focused (and no menu is active)
-    if matches!(app.active_menu, ActiveMenu::None) && app.search.focused {
+    if matches!(app.active_menu, ActiveMenu::None) && app.menu_bar.is_none() && app.search.focused {
         // Account for border (1) + space (1) + search icon " \u{1F50D} " (approx 4 display cols)
-        let cursor_x = chunks[0].x + 1 + 4 + app.search.cursor_pos as u16;
-        let cursor_y = chunks[0].y + 1;
+        let cursor_x = chunks[1].x + 1 + 4 + app.search.cursor_pos as u16;
+        let cursor_y = chunks[1].y + 1;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+fn draw_menu_bar_strip(frame: &mut Frame, app: &App, area: Rect) {
+    let menu_labels = [" File ", " Edit ", " View ", " Tools ", " Help "];
+
+    let active_idx = app.menu_bar.as_ref().map(|mb| mb.active_menu_index);
+
+    let mut spans = Vec::new();
+    for (i, label) in menu_labels.iter().enumerate() {
+        let style = if Some(i) == active_idx {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(40, 40, 50))
+        };
+        spans.push(Span::styled(*label, style));
+    }
+
+    // Fill rest with background
+    let labels_width: usize = menu_labels.iter().map(|l| l.len()).sum();
+    let remaining = (area.width as usize).saturating_sub(labels_width);
+    if remaining > 0 {
+        spans.push(Span::styled(
+            " ".repeat(remaining),
+            Style::default().bg(Color::Rgb(40, 40, 50)),
+        ));
+    }
+
+    let line = Line::from(spans);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_menu_bar_dropdown(frame: &mut Frame, menu_bar: &MenuBarState, area: Rect) {
+    let menu_labels = [" File ", " Edit ", " View ", " Tools ", " Help "];
+    let idx = menu_bar.active_menu_index;
+
+    if idx >= menu_bar.menus.len() {
+        return;
+    }
+
+    let menu = &menu_bar.menus[idx];
+
+    // Calculate position below the menu label
+    let mut x_offset: u16 = 0;
+    for i in 0..idx {
+        x_offset += menu_labels.get(i).map(|l| l.len() as u16).unwrap_or(6);
+    }
+
+    let max_label_len = menu.items.iter().map(|item| {
+        let total = item.label.len() + if item.shortcut.is_empty() { 0 } else { item.shortcut.len() + 4 };
+        total
+    }).max().unwrap_or(10);
+
+    let width = (max_label_len as u16 + 4).max(20).min(area.width.saturating_sub(x_offset));
+    let height = (menu.items.len() as u16 + 2).min(area.height.saturating_sub(2));
+
+    let popup_area = Rect::new(
+        x_offset.min(area.width.saturating_sub(width)),
+        1,
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    for (i, item) in menu.items.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+
+        let is_selected = i == menu_bar.active_item_index;
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let item_area = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+
+        let text = if item.shortcut.is_empty() {
+            format!(" {} ", item.label)
+        } else {
+            let padding = (inner.width as usize).saturating_sub(item.label.len() + item.shortcut.len() + 4);
+            format!(" {} {:>pad$}{} ", item.label, "", item.shortcut, pad = padding)
+        };
+
+        frame.render_widget(Paragraph::new(text).style(style), item_area);
     }
 }
 
@@ -73,7 +191,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     app.table.visible_rows = table_inner_height;
 
     // Build header
-    let header_columns: [(& str, SortColumn); 6] = [
+    let header_columns: [(&str, SortColumn); 6] = [
         ("Name", SortColumn::Name),
         ("Path", SortColumn::Path),
         ("Size", SortColumn::Size),
@@ -262,7 +380,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         )
     };
 
-    let right_text = " Tab:Search  F1-F6:Sort  \u{2190}\u{2192}:Scroll  Ctrl+\u{2190}\u{2192}:Resize  M:Menu  Ctrl+F:Filters  Ctrl+Q:Quit ";
+    let right_text = " Tab:Search  F1-F6:Sort  \u{2190}\u{2192}:Scroll  M:Menu  Ctrl+F:Filters  T:Treemap  F10:MenuBar  Ctrl+Q:Quit ";
 
     // Build the status line: left-aligned text + padding + right-aligned text
     let available_width = area.width as usize;
@@ -499,7 +617,7 @@ fn draw_search_filters(
                 Color::Rgb(30, 30, 40)
             };
             let style = Style::default().fg(Color::White).bg(bg);
-            let display = format!(" \u{25C0} {:^10} \u{25B6} ", mode_label);
+            let display = format!(" < {:^10} > ", mode_label);
             frame.render_widget(Paragraph::new(display).style(style), value_area);
         };
 
@@ -507,7 +625,7 @@ fn draw_search_filters(
 
     // Section header: Pattern
     frame.render_widget(
-        Paragraph::new("\u{2500}\u{2500} Pattern \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}")
+        Paragraph::new("-- Pattern ----------------------------------------")
             .style(Style::default().fg(Color::DarkGray)),
         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
     );
@@ -518,7 +636,7 @@ fn draw_search_filters(
 
     // Section header: Date
     frame.render_widget(
-        Paragraph::new("\u{2500}\u{2500} Date \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}")
+        Paragraph::new("-- Date ------------------------------------------")
             .style(Style::default().fg(Color::DarkGray)),
         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
     );
@@ -533,7 +651,7 @@ fn draw_search_filters(
 
     // Section header: Size
     frame.render_widget(
-        Paragraph::new("\u{2500}\u{2500} Size \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}")
+        Paragraph::new("-- Size ------------------------------------------")
             .style(Style::default().fg(Color::DarkGray)),
         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
     );
@@ -548,7 +666,7 @@ fn draw_search_filters(
 
     // Section header: Extension
     frame.render_widget(
-        Paragraph::new("\u{2500}\u{2500} Extension \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}")
+        Paragraph::new("-- Extension -------------------------------------")
             .style(Style::default().fg(Color::DarkGray)),
         Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1),
     );
@@ -610,5 +728,39 @@ fn draw_search_filters(
         };
         let cursor_x = inner.x + label_w + 1 + cursor_offset as u16;
         frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+fn draw_info_dialog(
+    frame: &mut Frame,
+    info: &crate::tui::menu::InfoDialog,
+    area: Rect,
+) {
+    let max_line_len = info.lines.iter().map(|l| l.len()).max().unwrap_or(20);
+    let width = ((max_line_len + 4) as u16).max(30).min(area.width.saturating_sub(4));
+    let height = ((info.lines.len() + 3) as u16).min(area.height.saturating_sub(4));
+    let popup_area = centered_rect(width, height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" {} ", info.title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    for (i, line) in info.lines.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let line_area = Rect::new(inner.x + 1, inner.y + i as u16, inner.width.saturating_sub(2), 1);
+        frame.render_widget(
+            Paragraph::new(line.as_str()).style(Style::default().fg(Color::White)),
+            line_area,
+        );
     }
 }

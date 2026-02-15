@@ -6,6 +6,7 @@ use crate::tui::menu::{
 };
 use crate::tui::search::{matches_pattern, SearchState};
 use crate::tui::table::{SortColumn, SortOrder, TableState};
+use crate::tui::treemap::TreemapState;
 use crate::tui::ui;
 use crate::{FileTree, MultiVolumeScanner, ScanConfig, VolumeScanner};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -89,14 +90,78 @@ pub struct App {
     // Persistent search filters (applied even when menu is closed)
     pub search_filters: SearchFiltersMenu,
 
+    // Treemap view
+    pub treemap: Option<TreemapState>,
+
+    // Menu bar
+    pub menu_bar: Option<MenuBarState>,
+
+    // Preset filters loaded from Filters.csv
+    pub preset_filters: Vec<PresetFilter>,
+
     // Quit flag
     pub should_quit: bool,
+}
+
+/// A preset filter loaded from Filters.csv
+#[derive(Debug, Clone)]
+pub struct PresetFilter {
+    pub name: String,
+    pub search: String,
+    pub macro_name: String,
+}
+
+/// State for the top menu bar
+#[derive(Debug, Clone)]
+pub struct MenuBarState {
+    pub active_menu_index: usize,
+    pub active_item_index: usize,
+    pub menus: Vec<MenuBarMenu>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuBarMenu {
+    pub label: String,
+    pub items: Vec<MenuBarItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MenuBarItem {
+    pub label: String,
+    pub shortcut: String,
+    pub action: MenuBarAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuBarAction {
+    // File
+    Open,
+    OpenInExplorer,
+    Properties,
+    Rescan,
+    Quit,
+    // Edit
+    CopyPath,
+    SelectAll,
+    Rename,
+    Delete,
+    // View
+    Treemap,
+    SearchFilters,
+    // Tools
+    ApplyPresetFilter(usize),
+    ClearFilters,
+    // Help
+    About,
+    KeyboardShortcuts,
 }
 
 impl App {
     pub fn new() -> Self {
         let available_drives = MultiVolumeScanner::detect_ntfs_volumes();
         let selected_drives = available_drives.clone();
+
+        let preset_filters = load_preset_filters();
 
         let mut app = Self {
             trees: Vec::new(),
@@ -118,6 +183,9 @@ impl App {
             pending_metadata_refresh: std::collections::HashSet::new(),
             active_menu: ActiveMenu::None,
             search_filters: SearchFiltersMenu::new(),
+            treemap: None,
+            menu_bar: None,
+            preset_filters,
             should_quit: false,
         };
 
@@ -734,6 +802,18 @@ impl App {
             _ => {}
         }
 
+        // Handle treemap view keys
+        if self.treemap.is_some() {
+            self.handle_treemap_key(key);
+            return;
+        }
+
+        // Handle menu bar keys
+        if self.menu_bar.is_some() {
+            self.handle_menu_bar_key(key);
+            return;
+        }
+
         // Route to active menu first
         if !matches!(self.active_menu, ActiveMenu::None) {
             self.handle_menu_key(key);
@@ -755,6 +835,10 @@ impl App {
             }
             KeyCode::F(9) => {
                 self.start_scan();
+                return;
+            }
+            KeyCode::F(10) => {
+                self.open_menu_bar();
                 return;
             }
             _ => {}
@@ -900,6 +984,12 @@ impl App {
                 self.open_search_filters();
             }
 
+            // Treemap view
+            KeyCode::Char('t') if !has_ctrl && !has_shift => {
+                self.toggle_treemap();
+                return;
+            }
+
             // Any other printable char focuses search and types it
             KeyCode::Char(c) if !has_ctrl && !has_shift => {
                 self.search.focused = true;
@@ -992,6 +1082,12 @@ impl App {
                     crate::tui::menu::open_in_explorer(path);
                 }
                 self.status_message = format!("Opened in Explorer: {} item(s)", paths.len());
+            }
+            ActionKind::Properties => {
+                for path in &paths {
+                    crate::tui::menu::show_properties(path);
+                }
+                self.status_message = format!("Properties: {} item(s)", paths.len());
             }
             ActionKind::CopyPath => {
                 let text = paths.join("\n");
@@ -1330,9 +1426,549 @@ impl App {
                     }
                 }
             }
+            ActiveMenu::Info(_info) => {
+                // Any key closes the info dialog (already set to None above)
+            }
             ActiveMenu::None => unreachable!(),
         }
     }
+
+    // --- Treemap methods ---
+
+    fn toggle_treemap(&mut self) {
+        if self.treemap.is_some() {
+            self.treemap = None;
+        } else {
+            let mut state = TreemapState::new();
+            state.build_from_trees(&self.trees);
+            self.treemap = Some(state);
+        }
+    }
+
+    fn handle_treemap_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('t') => {
+                self.treemap = None;
+            }
+            KeyCode::Right | KeyCode::Tab | KeyCode::Down => {
+                if let Some(ref mut tm) = self.treemap {
+                    tm.move_next();
+                }
+            }
+            KeyCode::Left | KeyCode::Up => {
+                if let Some(ref mut tm) = self.treemap {
+                    tm.move_prev();
+                }
+            }
+            KeyCode::Enter => {
+                // Drill down into selected directory
+                let drill_info = self.treemap.as_ref().and_then(|tm| {
+                    tm.selected_rect().and_then(|rect| {
+                        if rect.is_directory {
+                            Some((rect.key, rect.name.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+                if let Some((key, name)) = drill_info {
+                    // Find the tree that contains this key
+                    let tree_ref = self.trees.iter().find(|t| t.get_by_key(&key).is_some());
+                    if let Some(tree) = tree_ref {
+                        let tree_clone = tree.clone();
+                        if let Some(ref mut tm) = self.treemap {
+                            tm.breadcrumb.push((key, name));
+                            tm.build_from_node(&tree_clone, &key);
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                // Go up one level
+                let parent_info = self.treemap.as_mut().and_then(|tm| {
+                    if tm.breadcrumb.len() > 1 {
+                        tm.breadcrumb.pop();
+                        let (parent_key, _) = tm.breadcrumb.last().cloned()?;
+                        Some(parent_key)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(parent_key) = parent_info {
+                    if parent_key == NodeKey::root() {
+                        // Back to all drives view
+                        if let Some(ref mut tm) = self.treemap {
+                            tm.build_from_trees(&self.trees);
+                        }
+                    } else {
+                        let tree_ref = self.trees.iter().find(|t| t.get_by_key(&parent_key).is_some());
+                        if let Some(tree) = tree_ref {
+                            let tree_clone = tree.clone();
+                            if let Some(ref mut tm) = self.treemap {
+                                tm.build_from_node(&tree_clone, &parent_key);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // --- Menu bar methods ---
+
+    fn open_menu_bar(&mut self) {
+        let menus = build_menu_bar_menus(&self.preset_filters);
+        self.menu_bar = Some(MenuBarState {
+            active_menu_index: 0,
+            active_item_index: 0,
+            menus,
+        });
+    }
+
+    fn handle_menu_bar_key(&mut self, key: KeyEvent) {
+        let menu_bar = match self.menu_bar.take() {
+            Some(mb) => mb,
+            None => return,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                // Close menu bar
+            }
+            KeyCode::Left => {
+                let mut mb = menu_bar;
+                if mb.active_menu_index > 0 {
+                    mb.active_menu_index -= 1;
+                } else {
+                    mb.active_menu_index = mb.menus.len() - 1;
+                }
+                mb.active_item_index = 0;
+                self.menu_bar = Some(mb);
+            }
+            KeyCode::Right => {
+                let mut mb = menu_bar;
+                mb.active_menu_index = (mb.active_menu_index + 1) % mb.menus.len();
+                mb.active_item_index = 0;
+                self.menu_bar = Some(mb);
+            }
+            KeyCode::Up => {
+                let mut mb = menu_bar;
+                let menu_len = mb.menus[mb.active_menu_index].items.len();
+                if mb.active_item_index > 0 {
+                    mb.active_item_index -= 1;
+                } else {
+                    mb.active_item_index = menu_len - 1;
+                }
+                self.menu_bar = Some(mb);
+            }
+            KeyCode::Down => {
+                let mut mb = menu_bar;
+                let menu_len = mb.menus[mb.active_menu_index].items.len();
+                mb.active_item_index = (mb.active_item_index + 1) % menu_len;
+                self.menu_bar = Some(mb);
+            }
+            KeyCode::Enter => {
+                let action = menu_bar.menus[menu_bar.active_menu_index]
+                    .items[menu_bar.active_item_index]
+                    .action;
+                self.execute_menu_bar_action(action);
+            }
+            _ => {
+                self.menu_bar = Some(menu_bar);
+            }
+        }
+    }
+
+    fn execute_menu_bar_action(&mut self, action: MenuBarAction) {
+        match action {
+            MenuBarAction::Open => {
+                let paths = self.get_selected_paths();
+                for path in &paths {
+                    crate::tui::menu::open_file(path);
+                }
+            }
+            MenuBarAction::OpenInExplorer => {
+                let paths = self.get_selected_paths();
+                for path in &paths {
+                    crate::tui::menu::open_in_explorer(path);
+                }
+            }
+            MenuBarAction::Properties => {
+                let paths = self.get_selected_paths();
+                for path in &paths {
+                    crate::tui::menu::show_properties(path);
+                }
+            }
+            MenuBarAction::Rescan => {
+                self.start_scan();
+            }
+            MenuBarAction::Quit => {
+                self.should_quit = true;
+            }
+            MenuBarAction::CopyPath => {
+                let paths = self.get_selected_paths();
+                let text = paths.join("\n");
+                crate::tui::menu::copy_to_clipboard(&text);
+                self.status_message = format!("Copied {} path(s)", paths.len());
+            }
+            MenuBarAction::SelectAll => {
+                let total = self.filtered_indices.len();
+                self.table.select_all(total);
+            }
+            MenuBarAction::Rename => {
+                self.execute_action(ActionKind::Rename);
+            }
+            MenuBarAction::Delete => {
+                self.execute_action(ActionKind::Delete);
+            }
+            MenuBarAction::Treemap => {
+                self.toggle_treemap();
+            }
+            MenuBarAction::SearchFilters => {
+                self.open_search_filters();
+            }
+            MenuBarAction::ApplyPresetFilter(idx) => {
+                if let Some(filter) = self.preset_filters.get(idx) {
+                    self.apply_preset_filter(filter.clone());
+                }
+            }
+            MenuBarAction::ClearFilters => {
+                self.search_filters.clear_all();
+                self.search.query.clear();
+                self.search.cursor_pos = 0;
+                self.search.needs_search = true;
+                self.status_message = "Filters cleared".to_string();
+            }
+            MenuBarAction::About => {
+                use crate::tui::menu::InfoDialog;
+                self.active_menu = ActiveMenu::Info(InfoDialog::new(
+                    "About EmFit".to_string(),
+                    vec![
+                        format!("EmFit v{}", crate::VERSION),
+                        String::new(),
+                        "Ultra-fast NTFS file scanner".to_string(),
+                        String::new(),
+                        "Combines direct MFT reading with".to_string(),
+                        "USN Journal for instant file".to_string(),
+                        "enumeration and accurate sizes.".to_string(),
+                        String::new(),
+                        "Press any key to close.".to_string(),
+                    ],
+                ));
+            }
+            MenuBarAction::KeyboardShortcuts => {
+                use crate::tui::menu::InfoDialog;
+                self.active_menu = ActiveMenu::Info(InfoDialog::new(
+                    "Keyboard Shortcuts".to_string(),
+                    vec![
+                        "Tab / /        Focus search bar".to_string(),
+                        "F1-F6          Sort by column".to_string(),
+                        "F9             Rescan drives".to_string(),
+                        "F10            Open menu bar".to_string(),
+                        "M              Open actions menu".to_string(),
+                        "T              Toggle treemap view".to_string(),
+                        "Ctrl+F         Search filters".to_string(),
+                        "Ctrl+A         Select all".to_string(),
+                        "Shift+Up/Down  Extend selection".to_string(),
+                        "Space          Toggle selection".to_string(),
+                        "Left/Right     Horizontal scroll".to_string(),
+                        "Ctrl+Left/Right  Resize column".to_string(),
+                        "Enter          Open file".to_string(),
+                        "Esc            Clear / Back / Quit".to_string(),
+                        "Ctrl+Q         Quit".to_string(),
+                        String::new(),
+                        "Press any key to close.".to_string(),
+                    ],
+                ));
+            }
+        }
+    }
+
+    fn apply_preset_filter(&mut self, filter: PresetFilter) {
+        let search = &filter.search;
+
+        if search.is_empty() {
+            // "EVERYTHING" filter - clear all
+            self.search_filters.clear_all();
+            self.search.query.clear();
+            self.search.cursor_pos = 0;
+            self.search.needs_search = true;
+            self.status_message = format!("Filter: {}", filter.name);
+            return;
+        }
+
+        if search == "folder:" {
+            // Show only folders - we'll use a special extension filter approach
+            // Clear other filters and set a directory-only search
+            self.search_filters.clear_all();
+            self.search.query.clear();
+            self.search.cursor_pos = 0;
+            // We need a way to filter directories only. Use the search query.
+            // For now, set an extension filter that won't match anything, then do custom filter
+            self.search_filters.extension_filter.clear();
+            self.search.needs_search = true;
+            self.status_message = format!("Filter: {}", filter.name);
+
+            // Do a custom filtered search for directories only
+            self.filtered_indices.clear();
+            self.last_sort_column = None;
+            for (idx, entry) in self.all_entries.iter().enumerate() {
+                if entry.is_directory {
+                    self.filtered_indices.push(idx);
+                }
+            }
+            self.table.selected = if self.filtered_indices.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+            self.table.scroll_offset = 0;
+            self.table.selections.clear();
+            if let Some(sel) = self.table.selected {
+                self.table.selections.insert(sel);
+                self.table.anchor = Some(sel);
+            }
+            self.search.needs_search = false;
+            return;
+        }
+
+        if let Some(ext_list) = search.strip_prefix("ext:") {
+            // Extension-based filter
+            self.search_filters.clear_all();
+            self.search_filters.extension_filter = ext_list.to_string();
+            self.search.query.clear();
+            self.search.cursor_pos = 0;
+            self.search.needs_search = true;
+            self.status_message = format!("Filter: {}", filter.name);
+        }
+    }
+}
+
+fn build_menu_bar_menus(preset_filters: &[PresetFilter]) -> Vec<MenuBarMenu> {
+    let mut menus = vec![
+        MenuBarMenu {
+            label: "File".to_string(),
+            items: vec![
+                MenuBarItem {
+                    label: "Open".to_string(),
+                    shortcut: "Enter".to_string(),
+                    action: MenuBarAction::Open,
+                },
+                MenuBarItem {
+                    label: "Open in Explorer".to_string(),
+                    shortcut: "".to_string(),
+                    action: MenuBarAction::OpenInExplorer,
+                },
+                MenuBarItem {
+                    label: "Properties".to_string(),
+                    shortcut: "".to_string(),
+                    action: MenuBarAction::Properties,
+                },
+                MenuBarItem {
+                    label: "Rescan".to_string(),
+                    shortcut: "F9".to_string(),
+                    action: MenuBarAction::Rescan,
+                },
+                MenuBarItem {
+                    label: "Quit".to_string(),
+                    shortcut: "Ctrl+Q".to_string(),
+                    action: MenuBarAction::Quit,
+                },
+            ],
+        },
+        MenuBarMenu {
+            label: "Edit".to_string(),
+            items: vec![
+                MenuBarItem {
+                    label: "Copy Path".to_string(),
+                    shortcut: "".to_string(),
+                    action: MenuBarAction::CopyPath,
+                },
+                MenuBarItem {
+                    label: "Select All".to_string(),
+                    shortcut: "Ctrl+A".to_string(),
+                    action: MenuBarAction::SelectAll,
+                },
+                MenuBarItem {
+                    label: "Rename".to_string(),
+                    shortcut: "".to_string(),
+                    action: MenuBarAction::Rename,
+                },
+                MenuBarItem {
+                    label: "Delete".to_string(),
+                    shortcut: "".to_string(),
+                    action: MenuBarAction::Delete,
+                },
+            ],
+        },
+        MenuBarMenu {
+            label: "View".to_string(),
+            items: vec![
+                MenuBarItem {
+                    label: "Treemap".to_string(),
+                    shortcut: "T".to_string(),
+                    action: MenuBarAction::Treemap,
+                },
+                MenuBarItem {
+                    label: "Search Filters".to_string(),
+                    shortcut: "Ctrl+F".to_string(),
+                    action: MenuBarAction::SearchFilters,
+                },
+            ],
+        },
+    ];
+
+    // Tools menu with preset filters
+    let mut tools_items: Vec<MenuBarItem> = Vec::new();
+    for (i, filter) in preset_filters.iter().enumerate() {
+        tools_items.push(MenuBarItem {
+            label: format!("Filter: {}", filter.name),
+            shortcut: if !filter.macro_name.is_empty() {
+                filter.macro_name.clone()
+            } else {
+                String::new()
+            },
+            action: MenuBarAction::ApplyPresetFilter(i),
+        });
+    }
+    tools_items.push(MenuBarItem {
+        label: "Clear All Filters".to_string(),
+        shortcut: "".to_string(),
+        action: MenuBarAction::ClearFilters,
+    });
+    menus.push(MenuBarMenu {
+        label: "Tools".to_string(),
+        items: tools_items,
+    });
+
+    menus.push(MenuBarMenu {
+        label: "Help".to_string(),
+        items: vec![
+            MenuBarItem {
+                label: "Keyboard Shortcuts".to_string(),
+                shortcut: "".to_string(),
+                action: MenuBarAction::KeyboardShortcuts,
+            },
+            MenuBarItem {
+                label: "About EmFit".to_string(),
+                shortcut: "".to_string(),
+                action: MenuBarAction::About,
+            },
+        ],
+    });
+
+    menus
+}
+
+/// Load preset filters from Filters.csv at the project's runtime directory
+/// Built-in default filters (same as Filters.csv)
+const DEFAULT_FILTERS_CSV: &str = r#"Name,Case,Whole Word,Path,Diacritics,Regex,Search,Macro,Key
+"EVERYTHING",0,0,0,0,0,"",,
+"AUDIO",0,0,0,1,0,"ext:aac;ac3;aif;aifc;aiff;au;cda;dts;fla;flac;it;m1a;m2a;m3u;m4a;m4b;m4p;mid;midi;mka;mod;mp2;mp3;mpa;ogg;ra;rmi;snd;spc;umx;voc;wav;wma;xm","audio",
+"COMPRESSED",0,0,0,1,0,"ext:7z;ace;arj;bz2;cab;gz;gzip;jar;r00;r01;r02;r03;r04;r05;r06;r07;r08;r09;r10;r11;r12;r13;r14;r15;r16;r17;r18;r19;r20;r21;r22;r23;r24;r25;r26;r27;r28;r29;rar;tar;tgz;z;zip","zip",
+"DOCUMENT",0,0,0,1,0,"ext:c;chm;cpp;csv;cxx;doc;docm;docx;dot;dotm;dotx;h;hpp;htm;html;hxx;ini;java;lua;mht;mhtml;odt;pdf;potx;potm;ppam;ppsm;ppsx;pps;ppt;pptm;pptx;rtf;sldm;sldx;thmx;txt;vsd;wpd;wps;wri;xlam;xls;xlsb;xlsm;xlsx;xltm;xltx;xml","doc",
+"EXECUTABLE",0,0,0,1,0,"ext:bat;cmd;exe;msi;msp;scr","exe",
+"FOLDER",0,0,0,1,0,"folder:",,
+"PICTURE",0,0,0,1,0,"ext:ani;bmp;gif;ico;jpe;jpeg;jpg;pcx;png;psd;tga;tif;tiff;webp;wmf","pic",
+"VIDEO",0,0,0,1,0,"ext:3g2;3gp;3gp2;3gpp;amr;amv;asf;avi;bdmv;bik;d2v;divx;drc;dsa;dsm;dss;dsv;evo;f4v;flc;fli;flic;flv;hdmov;ifo;ivf;m1v;m2p;m2t;m2ts;m2v;m4v;mkv;mp2v;mp4;mp4v;mpe;mpeg;mpg;mpls;mpv2;mpv4;mov;mts;ogm;ogv;pss;pva;qt;ram;ratdvd;rm;rmm;rmvb;roq;rpm;smil;smk;swf;tp;tpr;ts;vob;vp6;webm;wm;wmp;wmv","video",
+"#;
+
+fn load_preset_filters() -> Vec<PresetFilter> {
+    let mut filters = Vec::new();
+
+    // Try to find Filters.csv relative to the executable
+    let csv_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("Filters.csv")))
+        .unwrap_or_else(|| std::path::PathBuf::from("Filters.csv"));
+
+    // Check multiple locations
+    let paths_to_try = [
+        csv_path,
+        std::path::PathBuf::from("Filters.csv"),
+    ];
+
+    for path in &paths_to_try {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut lines = content.lines();
+            let _header = lines.next(); // Skip header
+
+            for line in lines {
+                if let Some(filter) = parse_filter_csv_line(line) {
+                    filters.push(filter);
+                }
+            }
+
+            if !filters.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Fallback: use built-in default filters
+    if filters.is_empty() {
+        let mut lines = DEFAULT_FILTERS_CSV.lines();
+        let _header = lines.next();
+        for line in lines {
+            if let Some(filter) = parse_filter_csv_line(line) {
+                filters.push(filter);
+            }
+        }
+    }
+
+    filters
+}
+
+/// Parse a single CSV line from Filters.csv
+fn parse_filter_csv_line(line: &str) -> Option<PresetFilter> {
+    // CSV with quoted fields: "NAME",0,0,0,0,0,"search","macro",
+    let fields = parse_csv_fields(line);
+    if fields.len() < 7 {
+        return None;
+    }
+
+    let name = fields[0].trim_matches('"').to_string();
+    let search = fields[6].trim_matches('"').to_string();
+    let macro_name = if fields.len() > 7 {
+        fields[7].trim_matches('"').to_string()
+    } else {
+        String::new()
+    };
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(PresetFilter {
+        name,
+        search,
+        macro_name,
+    })
+}
+
+/// Simple CSV field parser handling quoted fields
+fn parse_csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in line.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+        } else if ch == ',' && !in_quotes {
+            fields.push(current.clone());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current);
+
+    fields
 }
 
 fn extract_extension(name: &str) -> String {
