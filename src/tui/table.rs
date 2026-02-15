@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 /// Which column is sorted
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortColumn {
@@ -34,6 +36,14 @@ pub struct TableState {
     pub visible_rows: usize,
     pub sort_column: SortColumn,
     pub sort_order: SortOrder,
+    /// Column widths: [Name, Path, Size, Ext, DateModified, Type]. 0 = Fill.
+    pub column_widths: [u16; 6],
+    /// Horizontal scroll offset (characters)
+    pub horizontal_offset: u16,
+    /// Multi-selection: set of selected logical indices
+    pub selections: BTreeSet<usize>,
+    /// Anchor point for shift-selection ranges
+    pub anchor: Option<usize>,
 }
 
 impl Default for TableState {
@@ -44,6 +54,24 @@ impl Default for TableState {
             visible_rows: 20,
             sort_column: SortColumn::Name,
             sort_order: SortOrder::Ascending,
+            column_widths: [25, 0, 12, 8, 20, 18],
+            horizontal_offset: 0,
+            selections: BTreeSet::new(),
+            anchor: None,
+        }
+    }
+}
+
+impl SortColumn {
+    /// Get the column index (0-based)
+    pub fn index(&self) -> usize {
+        match self {
+            SortColumn::Name => 0,
+            SortColumn::Path => 1,
+            SortColumn::Size => 2,
+            SortColumn::Extension => 3,
+            SortColumn::DateModified => 4,
+            SortColumn::Type => 5,
         }
     }
 }
@@ -58,6 +86,10 @@ impl TableState {
             None => 0,
         };
         self.selected = Some(i);
+        // Clear multi-selection on normal navigation
+        self.selections.clear();
+        self.selections.insert(i);
+        self.anchor = Some(i);
         self.ensure_visible(i);
     }
 
@@ -67,7 +99,89 @@ impl TableState {
             Some(i) => i - 1,
         };
         self.selected = Some(i);
+        self.selections.clear();
+        self.selections.insert(i);
+        self.anchor = Some(i);
         self.ensure_visible(i);
+    }
+
+    /// Extend selection with Shift+Down
+    pub fn shift_select_next(&mut self, total: usize) {
+        if total == 0 {
+            return;
+        }
+        let anchor = self.anchor.unwrap_or(0);
+        let i = match self.selected {
+            Some(i) => (i + 1).min(total - 1),
+            None => 0,
+        };
+        self.selected = Some(i);
+        // Select range from anchor to new position
+        self.selections.clear();
+        let (start, end) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+        for idx in start..=end {
+            self.selections.insert(idx);
+        }
+        self.ensure_visible(i);
+    }
+
+    /// Extend selection with Shift+Up
+    pub fn shift_select_prev(&mut self) {
+        let anchor = self.anchor.unwrap_or(0);
+        let i = match self.selected {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        };
+        self.selected = Some(i);
+        self.selections.clear();
+        let (start, end) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+        for idx in start..=end {
+            self.selections.insert(idx);
+        }
+        self.ensure_visible(i);
+    }
+
+    /// Move cursor down without changing selections (Ctrl+Down)
+    pub fn move_next(&mut self, total: usize) {
+        if total == 0 {
+            return;
+        }
+        let i = match self.selected {
+            Some(i) => (i + 1).min(total - 1),
+            None => 0,
+        };
+        self.selected = Some(i);
+        self.ensure_visible(i);
+    }
+
+    /// Move cursor up without changing selections (Ctrl+Up)
+    pub fn move_prev(&mut self) {
+        let i = match self.selected {
+            Some(0) | None => 0,
+            Some(i) => i - 1,
+        };
+        self.selected = Some(i);
+        self.ensure_visible(i);
+    }
+
+    /// Toggle selection of current item (Space key)
+    pub fn toggle_selection(&mut self) {
+        if let Some(i) = self.selected {
+            if self.selections.contains(&i) {
+                self.selections.remove(&i);
+            } else {
+                self.selections.insert(i);
+            }
+            self.anchor = Some(i);
+        }
+    }
+
+    /// Select all items
+    pub fn select_all(&mut self, total: usize) {
+        self.selections.clear();
+        for i in 0..total {
+            self.selections.insert(i);
+        }
     }
 
     pub fn page_down(&mut self, total: usize) {
@@ -80,6 +194,9 @@ impl TableState {
             None => jump.min(total - 1),
         };
         self.selected = Some(i);
+        self.selections.clear();
+        self.selections.insert(i);
+        self.anchor = Some(i);
         self.ensure_visible(i);
     }
 
@@ -90,11 +207,17 @@ impl TableState {
             None => 0,
         };
         self.selected = Some(i);
+        self.selections.clear();
+        self.selections.insert(i);
+        self.anchor = Some(i);
         self.ensure_visible(i);
     }
 
     pub fn select_first(&mut self) {
         self.selected = Some(0);
+        self.selections.clear();
+        self.selections.insert(0);
+        self.anchor = Some(0);
         self.scroll_offset = 0;
     }
 
@@ -103,6 +226,9 @@ impl TableState {
             return;
         }
         self.selected = Some(total - 1);
+        self.selections.clear();
+        self.selections.insert(total - 1);
+        self.anchor = Some(total - 1);
         self.ensure_visible(total - 1);
     }
 

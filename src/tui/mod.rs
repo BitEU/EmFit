@@ -1,5 +1,6 @@
 pub mod app;
 pub mod colors;
+pub mod menu;
 pub mod search;
 pub mod table;
 pub mod ui;
