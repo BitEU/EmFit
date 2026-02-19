@@ -29,6 +29,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Launch the graphical user interface
+    Gui,
+
     /// Access CLI subcommands (scan, search, largest, etc.)
     Cli {
         #[command(subcommand)]
@@ -184,6 +187,10 @@ fn main() {
                 eprintln!("{} {}", style("Error:").red().bold(), e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Gui) => {
+            // Launch GUI
+            emfit::gui::run();
         }
         Some(Commands::Cli { subcmd }) => {
             let result = match subcmd {

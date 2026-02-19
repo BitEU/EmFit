@@ -41,6 +41,14 @@ ratatui = "0.30.0"
 crossterm = "0.29"
 unicode-width = "0.2.2"
 
+# GUI dependencies
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui_extras = { version = "0.33.3", features = ["image"] }
+image = { version = "0.25.9", default-features = false, features = ["png"] }
+rfd = "0.17.2"
+open = "5.3.3"
+arboard = "3.6.1"
+
 [profile.release]
 opt-level = 3
 lto = true
