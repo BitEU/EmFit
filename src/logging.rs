@@ -3,7 +3,7 @@
 //! This module provides detailed logging for debugging file metadata issues,
 //! particularly for hard-linked files in WinSxS directories.
 //!
-//! FILTER: Only logs entries matching the DEBUG_PATTERN filename.
+//! FILTER: By default filtering is disabled; call `set_filter(Some(pattern))` to enable targeted filename filtering.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -14,9 +14,9 @@ use std::time::SystemTime;
 /// Global logger instance
 static LOGGER: OnceLock<Mutex<EmFitLogger>> = OnceLock::new();
 
-/// Debug filter pattern - ONLY log entries containing this string in their name
-/// Set to the specific filename we're debugging
-const DEBUG_PATTERN: &str = "ScheduleTime_80.contrast-white.png";
+/// Runtime filter for targeted debugging (None = disabled).
+/// Use `set_filter(Some(pattern))` at runtime to enable filtering.
+static FILTER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Log levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,7 +41,16 @@ impl std::fmt::Display for LogLevel {
 /// Check if a name matches our debug filter
 #[inline]
 fn matches_filter(name: &str) -> bool {
-    name.to_lowercase().contains(&DEBUG_PATTERN.to_lowercase())
+    let filter_lock = FILTER.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = filter_lock.lock() {
+        if let Some(ref pat) = *guard {
+            if pat.is_empty() {
+                return false;
+            }
+            return name.to_lowercase().contains(&pat.to_lowercase());
+        }
+    }
+    false
 }
 
 /// Main logger struct
@@ -63,7 +72,11 @@ impl EmFitLogger {
 
         if file.is_some() {
             eprintln!("[EmFit] Logging to: {}", log_path.display());
-            eprintln!("[EmFit] Filter pattern: '{}'", DEBUG_PATTERN);
+            let filter_desc = FILTER
+                .get()
+                .and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+                .unwrap_or_else(|| "<none>".to_string());
+            eprintln!("[EmFit] Filter pattern: '{}'", filter_desc);
         }
 
         Self {
@@ -140,7 +153,7 @@ pub fn error(module: &str, message: &str) {
 
 // ============================================================================
 // Specialized logging functions for different components
-// These ONLY log if the filename matches DEBUG_PATTERN
+// These ONLY log if the filename matches the runtime `FILTER` (use `set_filter`)
 // ============================================================================
 
 /// Log USN entry details - FILTERED by name
@@ -369,6 +382,9 @@ pub fn separator(label: &str) {
 }
 
 /// Set a filter pattern for targeted debugging (not used with const pattern)
-pub fn set_filter(_pattern: Option<String>) {
-    // No-op with const pattern
+pub fn set_filter(pattern: Option<String>) {
+    let filter_lock = FILTER.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = filter_lock.lock() {
+        *guard = pattern;
+    }
 }
