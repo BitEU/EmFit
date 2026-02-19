@@ -201,7 +201,8 @@ impl App {
         let mut last_tick = Instant::now();
 
         loop {
-            terminal.draw(|frame| ui::draw(frame, self))?;
+            terminal.draw(|frame| ui::draw(frame, self))
+                .map_err(|e| crate::EmFitError::WindowsError(format!("Terminal draw error: {}", e)))?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
             if event::poll(timeout).unwrap_or(false) {

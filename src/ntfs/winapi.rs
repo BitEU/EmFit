@@ -114,7 +114,7 @@ pub fn open_volume_path(path: &str) -> Result<SafeHandle> {
             None,
             windows::Win32::Storage::FileSystem::OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_NO_BUFFERING),
-            HANDLE::default(),
+            Some(HANDLE::default()),
         )
     };
 
@@ -146,7 +146,7 @@ pub fn open_file_read(path: &str) -> Result<SafeHandle> {
             None,
             windows::Win32::Storage::FileSystem::OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS),
-            HANDLE::default(),
+            Some(HANDLE::default()),
         )
     };
 
@@ -183,7 +183,7 @@ pub fn open_volume_for_file_id(drive_letter: char) -> Result<SafeHandle> {
             None,
             windows::Win32::Storage::FileSystem::OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS), // Required for directories
-            HANDLE::default(),
+            Some(HANDLE::default()),
         )
     };
 
