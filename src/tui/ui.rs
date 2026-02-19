@@ -1,3 +1,4 @@
+use crate::file_tree::NodeKey;
 use crate::tui::app::{App, MenuBarState};
 use crate::tui::colors;
 use crate::tui::menu::{ActiveMenu, SearchFilterField};
@@ -9,8 +10,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // If treemap is active, draw treemap view instead
-    if let Some(ref treemap) = app.treemap {
-        crate::tui::treemap::draw_treemap(frame, treemap, area);
+    if app.treemap.is_some() {
+        // Rebuild layout when terminal size changes so border padding stays correct
+        let needs_rebuild = {
+            let tm = app.treemap.as_ref().unwrap();
+            let tw = area.width.max(10) as f64;
+            let th = area.height.saturating_sub(2).max(4) as f64;
+            (tw - tm.screen_w).abs() > 0.5 || (th - tm.screen_h).abs() > 0.5
+        };
+        if needs_rebuild {
+            let current_key = app.treemap.as_ref().unwrap().current_key;
+            let breadcrumb = app.treemap.as_ref().unwrap().breadcrumb.clone();
+            let mut tm = app.treemap.take().unwrap();
+            tm.set_screen_size(area.width, area.height);
+            if current_key == NodeKey::root() {
+                tm.build_from_trees(&app.trees);
+            } else if let Some(tree) = app.trees.iter().find(|t| t.get_by_key(&current_key).is_some()) {
+                tm.build_from_node(tree, &current_key);
+                tm.breadcrumb = breadcrumb;
+            }
+            app.treemap = Some(tm);
+        }
+        let tm = app.treemap.as_ref().unwrap();
+        crate::tui::treemap::draw_treemap(frame, tm, area);
         return;
     }
 

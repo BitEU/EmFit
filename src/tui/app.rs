@@ -1440,6 +1440,10 @@ impl App {
             self.treemap = None;
         } else {
             let mut state = TreemapState::new();
+            // Get current terminal size for accurate border padding
+            if let Ok((w, h)) = crossterm::terminal::size() {
+                state.set_screen_size(w, h);
+            }
             state.build_from_trees(&self.trees);
             self.treemap = Some(state);
         }
