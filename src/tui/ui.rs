@@ -310,14 +310,15 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
             // Apply horizontal offset to all text content
             let h_off = app.table.horizontal_offset as usize;
             let apply_offset = |s: String| -> String {
-                if h_off == 0 || s.len() <= h_off {
-                    if h_off > 0 && s.len() <= h_off {
+                let char_count = s.chars().count();
+                if h_off == 0 || char_count <= h_off {
+                    if h_off > 0 && char_count <= h_off {
                         String::new()
                     } else {
                         s
                     }
                 } else {
-                    s[h_off..].to_string()
+                    s.chars().skip(h_off).collect()
                 }
             };
 
