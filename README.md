@@ -1,162 +1,165 @@
-# EmFit 🦀⚡
+# EmFit
 
-EmFit is a high-performance file system scanner for Windows NTFS volumes.
+High-performance NTFS file scanner for Windows. Combines the speed of Everything with WizTree's disk analysis.
 
 ## Features
 
-- **Blazing Fast** - Scan entire drives in seconds
-- **Accurate Sizes** - Direct MFT parsing for true file sizes
-- **Real-time Monitoring** - Track file changes as they happen
-- **Instant Search** - Find files across indexed volumes instantly
-- **Space Analysis** - WizTree-style directory size breakdown
-- **Memory Safe** - Written in Rust with zero-copy parsing
+- **Sub-second scanning** - Direct MFT/USN access indexes entire drives instantly
+- **Instant search** - Wildcard patterns, path scoping, regex, size/date filters
+- **Disk analysis** - Interactive treemap visualization of directory sizes
+- **Multi-drive support** - Scan and search across multiple volumes simultaneously
+- **Real-time monitoring** - USN journal tracking for live file system changes
+- **Batch operations** - Multi-select files for open, delete, rename, copy paths
 
-## How It Works
+## Installation
 
-### Phase 1: USN Journal Enumeration
-
-The USN (Update Sequence Number) Journal is NTFS's change journal. We use `FSCTL_ENUM_USN_DATA` to enumerate all files instantly:
-
-```
-┌─────────────────────────────────────────────┐
-│  FSCTL_ENUM_USN_DATA                        │
-│  ↓                                          │
-│  USN_RECORD for each file:                  │
-│  • File Reference Number (unique ID)        │
-│  • Parent Reference Number                  │
-│  • File Name                                │
-│  • Attributes (directory, hidden, etc.)     │
-└─────────────────────────────────────────────┘
+```powershell
+cargo build --release
 ```
 
-This gives us the complete file tree structure in seconds, but **not file sizes**.
-
-### Phase 2: MFT Reading (Optional)
-
-For accurate file sizes, we read the Master File Table directly:
-
-```
-┌─────────────────────────────────────────────┐
-│  Direct MFT Access                          │
-│  ↓                                          │
-│  MFT Record (1024 bytes each):              │
-│  • "FILE" signature verification            │
-│  • Fixup array for data integrity           │
-│  • $STANDARD_INFORMATION (timestamps)       │
-│  • $FILE_NAME (name, parent)                │
-│  • $DATA (file size, cluster runs)          │
-└─────────────────────────────────────────────┘
-```
+Binary: `target/release/emfit.exe`
 
 ## Usage
 
-### Scan a Volume
+### Interactive TUI (default)
 
-```bash
-# Quick scan (USN only)
-emfit scan -d C
-
-# Full scan with sizes
-emfit scan -d C --mft true
-
-# Exclude hidden/system files
-emfit scan -d C --hidden false --system false
+```powershell
+emfit
 ```
 
-### Search Files
+**Keyboard shortcuts:**
+- `/` or `Tab` - Focus search bar
+- `F1-F6` - Sort by column
+- `↑/↓`, `Pg Up/Pg Dwown`, or `j/k` - Navigate
+- `Space` - Multi-select
+- `Ctrl+A` - Select all
+- `Shift+↑/↓` - Range select
+- `Ctrl+↑/↓` - Move without selecting
+- `Enter` - Open file
+- `m` - Actions menu (open, delete, rename, etc.)
+- `t` - Toggle treemap view
+- `Ctrl+F` - Advanced filters (regex, size, date, extension)
+- `Ctrl+C/Q` - Quit
 
-```bash
-# Search for files
-emfit search -d C "config"
+### Search Syntax
 
-# Limit results
-emfit search -d C "*.log" --max 50
+**Basic patterns:**
+```
+config              # Contains "config"
+*.log               # Extension match
+temp*               # Starts with "temp"
+*cache*             # Contains "cache"
 ```
 
-### Find Largest Files
-
-```bash
-# Largest files
-emfit largest -d C --count 20
-
-# Largest directories
-emfit largest -d C --dirs --count 20
+**Path scoping:**
+```
+`C:\Users\Steven\Documents` hello.cpp    # Search specific folder
+`C:\Projects` *.rs                       # All Rust files in Projects
 ```
 
-### Analyze Disk Space
+**Advanced filters** (`Ctrl+F`):
+- **Regex:** `^test.*\.txt$`
+- **Size:** `> 100MB`, `< 1GB`, `between 50KB and 500KB`
+- **Date:** After, Before, or Between specific dates
+- **Extension:** Comma-separated list
 
-```bash
-# WizTree-style analysis
-emfit tree-size -d C --depth 3
+**Multiple patterns** (semicolon-separated):
+```
+*.cpp; *.h; Makefile
 ```
 
-### List NTFS Volumes
+### CLI Mode
 
-```bash
-emfit volumes
+**Scan volume:**
+```powershell
+emfit cli scan -d C --mft true
 ```
 
-### Monitor Changes
-
-```bash
-emfit monitor -d C
+**Search files:**
+```powershell
+emfit cli search -d C "*.dll" --max 100
 ```
 
-### Count raw USN Enumeration Entries
-
-```bash
-emfit.exe usn-count -d C
+**Largest files:**
+```powershell
+emfit cli largest -d C --count 50
 ```
 
-### Export Results
-
-```bash
-# Export to JSON
-emfit export -d C -o scan.json
-
-# Export to CSV
-emfit export -d C -o scan.csv -f csv
+**Largest directories:**
+```powershell
+emfit cli largest -d C --dirs --count 20
 ```
 
-## Architecture
+**Disk space analysis:**
+```powershell
+emfit cli tree-size -d C --depth 3
+```
 
+**List NTFS volumes:**
+```powershell
+emfit cli volumes
 ```
-emfit/
-├── src/
-│   ├── main.rs           # CLI entry point
-│   ├── lib.rs            # Library root
-│   ├── error.rs          # Error types
-│   ├── file_tree.rs      # Tree data structure
-│   ├── scanner.rs        # Main scanner logic
-│   └── ntfs/
-│       ├── mod.rs        # NTFS module root
-│       ├── structs.rs    # NTFS data structures
-│       ├── winapi.rs     # Windows API bindings
-│       ├── mft.rs        # MFT parser
-│       └── usn.rs        # USN Journal scanner
-└── Cargo.toml
+
+**Monitor changes:**
+```powershell
+emfit cli monitor -d C
 ```
+
+**Export results:**
+```powershell
+emfit cli export -d C -o output.json -f json
+emfit cli export -d C -o output.csv -f csv
+```
+
+## How It Works
+
+EmFit uses two NTFS features for maximum performance:
+
+**1. USN Journal Enumeration** (`FSCTL_ENUM_USN_DATA`)
+- Scans entire file system in seconds
+- Provides file names, parent references, and attributes
+- Doesn't include file sizes
+
+**2. Direct MFT Reading**
+- Reads Master File Table for accurate metadata
+- Parses `$STANDARD_INFORMATION`, `$FILE_NAME`, and `$DATA` attributes
+- Gets true file sizes and timestamps
+
+## Preset Filters
+
+Create `Filters.csv` in the executable directory:
+
+```csv
+Name,Extensions,Description
+Videos,mp4;mkv;avi;mov;wmv,Video files
+Images,jpg;png;gif;bmp;webp,Image files
+Documents,pdf;doc;docx;txt;md,Documents
+Archives,zip;rar;7z;tar;gz,Compressed files
+Code,rs;cpp;c;h;py;js,Source code
+```
+
+Access via menu bar in TUI.
+
+## Performance
+
+- **Typical scan time:** 500GB drive with 1M files in ~2 seconds
+- **Memory usage:** ~200-300MB for 1M files
+- **Search latency:** <1ms for indexed results
 
 ## Requirements
 
-- Windows 10/11 (or Server 2016+)
-- Administrator privileges (for raw volume access)
+- Windows 10/11
+- Administrator privileges (for direct MFT/USN access)
 - NTFS volumes only
 
-## Building
+## Technical Details
 
-```bash
-# Release CLI build
-cargo build --release
+- **Language:** Rust
+- **TUI Framework:** Ratatui
+- **Threading:** Rayon + Crossbeam for parallel processing
+- **Parsing:** Zero-copy MFT record parsing
+- **Optimization:** LTO + single codegen unit for release builds
 
-# Release GUI build
-cargo build --bin emfit-gui --release
+## License
 
-# Run tests
-cargo test
-```
-
-Additional resources:
-- [FSCTL Structures](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/4dc02779-9d95-43f8-bba4-8d4ce4961458)
-- [Microsoft NTFS Technical Reference](https://docs.microsoft.com/en-us/windows-server/storage/file-server/ntfs-overview)
-- [The Sleuth Kit](https://github.com/sleuthkit/sleuthkit) - Forensic NTFS parsing
+See repository for license information.
