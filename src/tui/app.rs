@@ -1863,59 +1863,53 @@ fn build_menu_bar_menus(preset_filters: &[PresetFilter]) -> Vec<MenuBarMenu> {
     menus
 }
 
-/// Load preset filters from Filters.csv at the project's runtime directory
-/// Built-in default filters (same as Filters.csv)
-const DEFAULT_FILTERS_CSV: &str = r#"Name,Case,Whole Word,Path,Diacritics,Regex,Search,Macro,Key
-"EVERYTHING",0,0,0,0,0,"",,
-"AUDIO",0,0,0,1,0,"ext:aac;ac3;aif;aifc;aiff;au;cda;dts;fla;flac;it;m1a;m2a;m3u;m4a;m4b;m4p;mid;midi;mka;mod;mp2;mp3;mpa;ogg;ra;rmi;snd;spc;umx;voc;wav;wma;xm","audio",
-"COMPRESSED",0,0,0,1,0,"ext:7z;ace;arj;bz2;cab;gz;gzip;jar;r00;r01;r02;r03;r04;r05;r06;r07;r08;r09;r10;r11;r12;r13;r14;r15;r16;r17;r18;r19;r20;r21;r22;r23;r24;r25;r26;r27;r28;r29;rar;tar;tgz;z;zip","zip",
-"DOCUMENT",0,0,0,1,0,"ext:c;chm;cpp;csv;cxx;doc;docm;docx;dot;dotm;dotx;h;hpp;htm;html;hxx;ini;java;lua;mht;mhtml;odt;pdf;potx;potm;ppam;ppsm;ppsx;pps;ppt;pptm;pptx;rtf;sldm;sldx;thmx;txt;vsd;wpd;wps;wri;xlam;xls;xlsb;xlsm;xlsx;xltm;xltx;xml","doc",
-"EXECUTABLE",0,0,0,1,0,"ext:bat;cmd;exe;msi;msp;scr","exe",
-"FOLDER",0,0,0,1,0,"folder:",,
-"PICTURE",0,0,0,1,0,"ext:ani;bmp;gif;ico;jpe;jpeg;jpg;pcx;png;psd;tga;tif;tiff;webp;wmf","pic",
-"VIDEO",0,0,0,1,0,"ext:3g2;3gp;3gp2;3gpp;amr;amv;asf;avi;bdmv;bik;d2v;divx;drc;dsa;dsm;dss;dsv;evo;f4v;flc;fli;flic;flv;hdmov;ifo;ivf;m1v;m2p;m2t;m2ts;m2v;m4v;mkv;mp2v;mp4;mp4v;mpe;mpeg;mpg;mpls;mpv2;mpv4;mov;mts;ogm;ogv;pss;pva;qt;ram;ratdvd;rm;rmm;rmvb;roq;rpm;smil;smk;swf;tp;tpr;ts;vob;vp6;webm;wm;wmp;wmv","video",
-"#;
-
+/// Load preset filters from Filters.csv in the same directory as emfit.exe
+/// Returns empty Vec if Filters.csv is not found or cannot be parsed
 fn load_preset_filters() -> Vec<PresetFilter> {
     let mut filters = Vec::new();
 
-    // Try to find Filters.csv relative to the executable
-    let csv_path = std::env::current_exe()
+    // Find Filters.csv next to the executable
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|p| p.join("Filters.csv")))
-        .unwrap_or_else(|| std::path::PathBuf::from("Filters.csv"));
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
-    // Check multiple locations
-    let paths_to_try = [
-        csv_path,
-        std::path::PathBuf::from("Filters.csv"),
-    ];
+    let csv_path = if let Some(dir) = exe_dir {
+        dir.join("Filters.csv")
+    } else {
+        // Fallback to current directory if we can't get exe path
+        std::path::PathBuf::from("Filters.csv")
+    };
 
-    for path in &paths_to_try {
-        if let Ok(content) = std::fs::read_to_string(path) {
+    // Log the path we're trying to load from
+    eprintln!("[EmFit] Looking for Filters.csv at: {}", csv_path.display());
+
+    // Try to load the CSV file
+    match std::fs::read_to_string(&csv_path) {
+        Ok(content) => {
             let mut lines = content.lines();
             let _header = lines.next(); // Skip header
 
-            for line in lines {
+            for (line_num, line) in lines.enumerate() {
+                if line.trim().is_empty() {
+                    continue; // Skip empty lines
+                }
+                
                 if let Some(filter) = parse_filter_csv_line(line) {
                     filters.push(filter);
+                } else {
+                    eprintln!("[EmFit] Warning: Failed to parse filter on line {}", line_num + 2);
                 }
             }
 
             if !filters.is_empty() {
-                break;
+                eprintln!("[EmFit] Successfully loaded {} filters from Filters.csv", filters.len());
+            } else {
+                eprintln!("[EmFit] Warning: No valid filters found in Filters.csv");
             }
         }
-    }
-
-    // Fallback: use built-in default filters
-    if filters.is_empty() {
-        let mut lines = DEFAULT_FILTERS_CSV.lines();
-        let _header = lines.next();
-        for line in lines {
-            if let Some(filter) = parse_filter_csv_line(line) {
-                filters.push(filter);
-            }
+        Err(e) => {
+            eprintln!("[EmFit] Warning: Could not load Filters.csv: {}", e);
+            eprintln!("[EmFit] Place Filters.csv next to emfit.exe to enable preset filters");
         }
     }
 
