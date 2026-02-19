@@ -15,6 +15,7 @@ pub struct TreemapRect {
     pub w: f64,
     pub h: f64,
     pub key: NodeKey,
+    pub has_visible_children: bool,  // Don't render if children are shown inside
 }
 
 /// State for the treemap view
@@ -35,60 +36,87 @@ impl TreemapState {
         }
     }
 
-    /// Build treemap from the root of a set of trees
+    /// Build treemap from the root of a set of trees (WizTree-style hierarchical layout)
     pub fn build_from_trees(&mut self, trees: &[Arc<FileTree>]) {
         self.rects.clear();
         self.selected = 0;
         self.breadcrumb.clear();
         self.current_key = NodeKey::root();
 
-        // Gather top-level children from all drive roots
-        let mut items: Vec<(String, u64, bool, NodeKey, usize)> = Vec::new();
-
         for tree in trees {
             if let Some(root) = tree.root() {
                 let drive = format!("{}:", tree.drive_letter);
-                // Add each drive root's children
-                let children = tree.get_children(&root.key());
-                for child in children {
-                    // Skip "." and ".." entries
-                    if child.name == "." || child.name == ".." {
-                        continue;
-                    }
-                    if child.is_directory {
-                        let size = if child.total_size > 0 {
-                            child.total_size
-                        } else {
-                            child.file_size
-                        };
-                        if size > 0 {
-                            items.push((
-                                child.name.clone(),
-                                size,
-                                true,
-                                child.key(),
-                                0,
-                            ));
-                        }
-                    } else if child.file_size > 0 {
-                        items.push((
-                            child.name.clone(),
-                            child.file_size,
-                            false,
-                            child.key(),
-                            0,
-                        ));
-                    }
-                }
                 self.breadcrumb.push((root.key(), drive));
+                
+                // Layout children hierarchically within the available space
+                self.layout_hierarchical(tree, &root.key(), 0.0, 0.0, 1.0, 1.0, 0);
+            }
+        }
+    }
+
+    /// Hierarchical treemap layout - shows files WITHIN parent directory boxes (like WizTree)
+    fn layout_hierarchical(
+        &mut self,
+        tree: &FileTree,
+        parent_key: &NodeKey,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        depth: usize,
+    ) {
+        // Minimum box size in screen units to be visible
+        const MIN_WIDTH: f64 = 0.01;
+        const MIN_HEIGHT: f64 = 0.01;
+        const MAX_DEPTH: usize = 4; // Max recursion depth for nested layouts
+
+        if w < MIN_WIDTH || h < MIN_HEIGHT || depth > MAX_DEPTH {
+            return;
+        }
+
+        let children = tree.get_children(parent_key);
+        let mut items: Vec<(String, u64, bool, NodeKey)> = Vec::new();
+
+        for child in children {
+            if child.name == "." || child.name == ".." {
+                continue;
+            }
+
+            let size = if child.is_directory {
+                if child.total_size > 0 {
+                    child.total_size
+                } else {
+                    child.file_size
+                }
+            } else {
+                child.file_size
+            };
+
+            // Skip tiny items that won't be visible
+            if size > 0 {
+                items.push((child.name.clone(), size, child.is_directory, child.key()));
             }
         }
 
-        items.sort_by(|a, b| b.1.cmp(&a.1));
-        // Limit to top items for performance
-        items.truncate(200);
+        if items.is_empty() {
+            return;
+        }
 
-        self.layout_squarify(&items, 0.0, 0.0, 1.0, 1.0);
+        // Sort by size descending
+        items.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Limit items to prevent excessive detail at deep levels
+        let limit = match depth {
+            0 => 1000,
+            1 => 500,
+            2 => 300,
+            3 => 150,
+            _ => 75,
+        };
+        items.truncate(limit);
+
+        // Layout items in this rectangle and recurse into directories
+        self.layout_squarify_hierarchical(tree, &items, x, y, w, h, depth);
     }
 
     /// Build treemap for a specific directory node
@@ -97,52 +125,22 @@ impl TreemapState {
         self.selected = 0;
         self.current_key = *key;
 
-        let mut items: Vec<(String, u64, bool, NodeKey, usize)> = Vec::new();
-
-        if let Some(node) = tree.get_by_key(key) {
-            let children = tree.get_children(&node.key());
-            for child in children {
-                // Skip "." and ".." entries
-                if child.name == "." || child.name == ".." {
-                    continue;
-                }
-                let size = if child.is_directory {
-                    if child.total_size > 0 {
-                        child.total_size
-                    } else {
-                        child.file_size
-                    }
-                } else {
-                    child.file_size
-                };
-                if size > 0 {
-                    items.push((
-                        child.name.clone(),
-                        size,
-                        child.is_directory,
-                        child.key(),
-                        0,
-                    ));
-                }
-            }
-        }
-
-        items.sort_by(|a, b| b.1.cmp(&a.1));
-        items.truncate(200);
-
-        self.layout_squarify(&items, 0.0, 0.0, 1.0, 1.0);
+        // Layout children hierarchically
+        self.layout_hierarchical(tree, key, 0.0, 0.0, 1.0, 1.0, 0);
     }
 
-    /// Squarified treemap layout algorithm
-    fn layout_squarify(
+    /// Squarified treemap layout with hierarchical recursion into directories
+    fn layout_squarify_hierarchical(
         &mut self,
-        items: &[(String, u64, bool, NodeKey, usize)],
+        tree: &FileTree,
+        items: &[(String, u64, bool, NodeKey)],
         x: f64,
         y: f64,
         w: f64,
         h: f64,
+        depth: usize,
     ) {
-        if items.is_empty() || w <= 0.0 || h <= 0.0 {
+        if items.is_empty() || w <= 0.001 || h <= 0.001 {
             return;
         }
 
@@ -151,59 +149,74 @@ impl TreemapState {
             return;
         }
 
-        // Normalize sizes to fit area
-        let area = w * h;
-
-        // Use slice-and-dice with squarification
-        self.squarify_recursive(items, x, y, w, h, total, area);
+        self.squarify_recursive_hierarchical(tree, items, x, y, w, h, total, depth);
     }
 
-    fn squarify_recursive(
+    fn squarify_recursive_hierarchical(
         &mut self,
-        items: &[(String, u64, bool, NodeKey, usize)],
+        tree: &FileTree,
+        items: &[(String, u64, bool, NodeKey)],
         x: f64,
         y: f64,
         w: f64,
         h: f64,
         total: f64,
-        _area: f64,
+        depth: usize,
     ) {
         if items.is_empty() || w < 0.001 || h < 0.001 {
             return;
         }
 
         if items.len() == 1 {
+            let item = &items[0];
+            
+            // Check if this directory will have visible children
+            let will_recurse = item.2 && w > 0.02 && h > 0.02;
+            
             self.rects.push(TreemapRect {
-                name: items[0].0.clone(),
-                size: items[0].1,
-                is_directory: items[0].2,
-                depth: items[0].4,
+                name: item.0.clone(),
+                size: item.1,
+                is_directory: item.2,
+                depth,
                 x,
                 y,
                 w,
                 h,
-                key: items[0].3,
+                key: item.3,
+                has_visible_children: will_recurse,
             });
+
+            // If it's a directory, recursively layout its children WITHIN this box
+            if will_recurse {
+                // Reserve some space for borders (1% padding for better space use)
+                let padding = 0.01;
+                let inner_x = x + w * padding;
+                let inner_y = y + h * padding;
+                let inner_w = w * (1.0 - 2.0 * padding);
+                let inner_h = h * (1.0 - 2.0 * padding);
+                
+                if inner_w > 0.01 && inner_h > 0.01 {
+                    self.layout_hierarchical(tree, &item.3, inner_x, inner_y, inner_w, inner_h, depth + 1);
+                }
+            }
             return;
         }
 
-        // Determine layout direction (lay out along shorter side)
+        // Determine layout direction
         let vertical = w >= h;
-
-        // Find the optimal split point using squarification
-        let mut best_split = 1;
-        let mut best_aspect = f64::MAX;
-
         let short_side = if vertical { h } else { w };
         let long_side = if vertical { w } else { h };
 
+        // Find optimal split point
+        let mut best_split = 1;
+        let mut best_aspect = f64::MAX;
         let mut running_sum = 0.0;
+
         for i in 0..items.len() {
             running_sum += items[i].1 as f64;
             let fraction = running_sum / total;
             let strip_length = fraction * long_side;
 
-            // Calculate worst aspect ratio in this strip
             let mut worst = 0.0_f64;
             let mut strip_sum = 0.0;
             for j in 0..=i {
@@ -225,7 +238,7 @@ impl TreemapState {
                 best_aspect = worst;
                 best_split = i + 1;
             } else {
-                break; // Aspect ratio getting worse, stop
+                break;
             }
         }
 
@@ -251,17 +264,34 @@ impl TreemapState {
             };
             pos += item_fraction;
 
+            // Check if this directory will have visible children
+            let will_recurse = item.2 && iw > 0.02 && ih > 0.02;
+
             self.rects.push(TreemapRect {
                 name: item.0.clone(),
                 size: item.1,
                 is_directory: item.2,
-                depth: item.4,
+                depth,
                 x: ix,
                 y: iy,
                 w: iw,
                 h: ih,
                 key: item.3,
+                has_visible_children: will_recurse,
             });
+
+            // If it's a directory, recursively layout children WITHIN this box
+            if will_recurse {
+                let padding = 0.01;
+                let inner_x = ix + iw * padding;
+                let inner_y = iy + ih * padding;
+                let inner_w = iw * (1.0 - 2.0 * padding);
+                let inner_h = ih * (1.0 - 2.0 * padding);
+                
+                if inner_w > 0.01 && inner_h > 0.01 {
+                    self.layout_hierarchical(tree, &item.3, inner_x, inner_y, inner_w, inner_h, depth + 1);
+                }
+            }
         }
 
         // Recurse on remaining items
@@ -273,7 +303,7 @@ impl TreemapState {
             } else {
                 (x, y + strip_fraction * h, w, h * (1.0 - strip_fraction))
             };
-            self.squarify_recursive(remaining, rx, ry, rw, rh, remaining_total, rw * rh);
+            self.squarify_recursive_hierarchical(tree, remaining, rx, ry, rw, rh, remaining_total, depth);
         }
     }
 
@@ -382,6 +412,12 @@ pub fn draw_treemap(frame: &mut Frame, state: &TreemapState, area: Rect) {
     let map_h = map_area.height as f64;
 
     for (i, rect) in state.rects.iter().enumerate() {
+        // Skip rendering directories that have visible children inside them
+        // (the children will render instead, preventing overlap)
+        if rect.has_visible_children {
+            continue;
+        }
+        
         let rx = map_area.x + (rect.x * map_w) as u16;
         let ry = map_area.y + (rect.y * map_h) as u16;
         let rw = ((rect.x + rect.w) * map_w) as u16 - (rect.x * map_w) as u16;
@@ -408,57 +444,90 @@ pub fn draw_treemap(frame: &mut Frame, state: &TreemapState, area: Rect) {
             Color::White
         };
 
-        // Truncate name to fit
-        let display_name = if cell_area.width >= 3 && cell_area.height >= 1 {
-            let max_chars = (cell_area.width as usize).saturating_sub(1);
+        // Smart text rendering based on available space
+        let w = cell_area.width;
+        let h = cell_area.height;
+        
+        // Determine what to show based on box size
+        let content = if w >= 12 && h >= 2 {
+            // Large box: show name + size
+            let name_max = w.saturating_sub(1) as usize;
+            let name = if rect.name.len() > name_max {
+                &rect.name[..name_max]
+            } else {
+                &rect.name
+            };
+            let size_str = crate::format_size(rect.size);
+            format!("{}\n{}", name, size_str)
+        } else if w >= 8 && h >= 1 {
+            // Medium box: show name only, truncated
+            let max_chars = w.saturating_sub(1) as usize;
             if rect.name.len() > max_chars {
-                format!("{}", &rect.name[..max_chars])
+                rect.name[..max_chars].to_string()
             } else {
                 rect.name.clone()
             }
+        } else if w >= 3 && h >= 1 {
+            // Small box: show first few chars
+            let max_chars = (w as usize).min(rect.name.len());
+            rect.name[..max_chars].to_string()
         } else {
+            // Tiny box: no text
             String::new()
         };
 
-        // Add size on second line if enough space
-        let content = if cell_area.height >= 2 && cell_area.width >= 4 {
-            let size_str = crate::format_size(rect.size);
-            let max_chars = cell_area.width as usize;
-            let size_display = if size_str.len() > max_chars {
-                size_str[..max_chars].to_string()
+        // Adaptive border rendering - only show borders for larger boxes
+        if w >= 6 && h >= 3 {
+            // Large enough for borders
+            let border_style = if is_selected {
+                Style::default().fg(Color::Yellow)
             } else {
-                size_str
+                Style::default().fg(Color::Rgb(60, 60, 60))
             };
-            format!("{}\n{}", display_name, size_display)
-        } else {
-            display_name
-        };
-
-        let border_style = if is_selected {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Rgb(80, 80, 80))
-        };
-
-        if cell_area.width >= 4 && cell_area.height >= 3 {
+            
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style);
             let inner = block.inner(cell_area);
+            
             frame.render_widget(
                 Paragraph::new("").style(Style::default().bg(bg)),
                 cell_area,
             );
             frame.render_widget(block, cell_area);
-            if inner.width > 0 && inner.height > 0 {
+            
+            if inner.width > 0 && inner.height > 0 && !content.is_empty() {
                 frame.render_widget(
                     Paragraph::new(content).style(Style::default().fg(fg).bg(bg)),
                     inner,
                 );
             }
+        } else if w >= 2 && h >= 1 {
+            // Small box: just colored rectangle with text if it fits
+            if is_selected && w >= 2 && h >= 1 {
+                // Draw thin border for selection
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow));
+                frame.render_widget(block, cell_area);
+            }
+            
+            if !content.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(content).style(Style::default().fg(fg).bg(bg)),
+                    cell_area,
+                );
+            } else {
+                // Just fill with color
+                frame.render_widget(
+                    Paragraph::new("").style(Style::default().bg(bg)),
+                    cell_area,
+                );
+            }
         } else {
+            // Tiny box: just color, no text or borders
             frame.render_widget(
-                Paragraph::new(content).style(Style::default().fg(fg).bg(bg)),
+                Paragraph::new("").style(Style::default().bg(bg)),
                 cell_area,
             );
         }
@@ -466,15 +535,15 @@ pub fn draw_treemap(frame: &mut Frame, state: &TreemapState, area: Rect) {
 
     // Draw info bar
     let info_text = if let Some(rect) = state.selected_rect() {
-        let icon = if rect.is_directory { "\u{1F4C1}" } else { "\u{1F4C4}" };
+        let icon = if rect.is_directory { "DIR" } else { "FILE" };
         format!(
-            " {} {} - {} | Arrows/Tab:Navigate  Enter:Drill Down  Backspace:Go Up  Esc:Close  T:Toggle",
+            " [{} {} - {}] | Arrows/Tab:Navigate Enter:Drill Backspace:Up Esc:Close T:Toggle",
             icon,
             rect.name,
             crate::format_size(rect.size),
         )
     } else {
-        " Treemap View | Arrows/Tab:Navigate  Enter:Drill Down  Backspace:Up  Esc:Close".to_string()
+        " Treemap View | Arrows/Tab:Navigate Enter:Drill Backspace:Up Esc:Close".to_string()
     };
 
     let info = Paragraph::new(info_text)
