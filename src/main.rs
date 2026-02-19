@@ -440,7 +440,7 @@ fn cmd_tree_size(drive: char, path: Option<&str>, depth: usize) -> emfit::Result
     let tree = scanner.scan()?;
 
     // Find starting node
-    let start_node = if let Some(p) = path {
+    let start_node = if let Some(_p) = path {
         // Would need path-to-record-number lookup
         tree.root()
     } else {
@@ -536,7 +536,7 @@ fn cmd_monitor(drive: char) -> emfit::Result<()> {
     println!("Press Ctrl+C to stop.");
     println!();
 
-    let mut monitor = ChangeMonitor::new(drive)?;
+    let _monitor = ChangeMonitor::new(drive)?;
 
     // Would need a dummy tree for this - simplified implementation
     println!(

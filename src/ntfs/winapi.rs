@@ -75,7 +75,7 @@ impl Drop for SafeHandle {
     fn drop(&mut self) {
         if self.is_valid() {
             unsafe {
-                windows::Win32::Foundation::CloseHandle(
+                let _ = windows::Win32::Foundation::CloseHandle(
                     windows::Win32::Foundation::HANDLE(self.handle as *mut std::ffi::c_void)
                 );
             }

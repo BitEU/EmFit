@@ -436,7 +436,7 @@ fn leaf_color(name: &str, is_directory: bool, index: usize) -> Color {
         "rs" | "go" | "c" | "cpp" | "h" | "hpp"
         | "cs"                                       => Color::Rgb(75, 150, 220),
         "py" | "pyw"                                 => Color::Rgb(55, 140, 185),
-        "js" | "ts" | "jsx" | "tsx"                  => Color::Rgb(215, 195, 45),
+        "js" | "jsx" | "tsx"                         => Color::Rgb(215, 195, 45),
         "java" | "kt" | "scala"                     => Color::Rgb(170, 100, 55),
         "html" | "htm" | "css" | "scss"              => Color::Rgb(215, 75, 45),
         "json" | "xml" | "sql"                       => Color::Rgb(140, 160, 55),

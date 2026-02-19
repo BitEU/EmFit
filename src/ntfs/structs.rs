@@ -1,7 +1,7 @@
 //! NTFS on-disk structures and constants
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 
 // ============================================================================
 // NTFS Constants

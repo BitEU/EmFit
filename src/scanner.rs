@@ -8,8 +8,8 @@ use crate::error::{Result, EmFitError};
 use crate::file_tree::{FileTree, TreeBuilder, TreeNode};
 use crate::logging;
 use crate::ntfs::{
-    open_volume, FileEntry, MftParser, MftRecordFetcher, NtfsVolumeData,
-    UsnEntry, UsnMonitor, UsnScanner, VolumeIO, open_physical_drive_for_volume,
+    open_volume, MftParser, MftRecordFetcher, NtfsVolumeData,
+    UsnMonitor, UsnScanner, VolumeIO, open_physical_drive_for_volume,
 };
 use crate::ntfs::winapi::get_ntfs_volume_data;
 use indicatif::{ProgressBar, ProgressStyle};

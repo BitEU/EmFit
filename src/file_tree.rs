@@ -16,8 +16,6 @@ use crate::ntfs::mft::{extract_parent_info, extract_parent_info_debug};
 use crate::ntfs::physical::MftRecordFetcher;
 use crate::ntfs::winapi::{get_ntfs_file_record, open_volume, open_volume_for_file_id, SafeHandle};
 use dashmap::DashMap;
-use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
@@ -382,7 +380,7 @@ impl FileTree {
             parts.push(node.name.clone());
 
             // Now walk up the parent chain
-            let mut current_parent = node.parent_record_number;
+            let current_parent = node.parent_record_number;
             self.walk_parent_chain(&mut parts, current_parent, debug);
         }
 
@@ -715,7 +713,7 @@ impl FileTree {
     }
 
     /// Iterate over all nodes
-    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<NodeKey, TreeNode>> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, NodeKey, TreeNode>> + '_ {
         self.nodes.iter()
     }
 
