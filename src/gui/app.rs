@@ -886,7 +886,7 @@ impl eframe::App for GuiApp {
 
         // ── Menu bar ────────────────────────────────────────────────────
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 // File menu
                 ui.menu_button("File", |ui| {
                     if ui.button("Open").clicked() {
@@ -894,26 +894,26 @@ impl eframe::App for GuiApp {
                         for p in &paths {
                             dialogs::open_file(p);
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Open in Explorer").clicked() {
                         let paths = self.get_selected_paths();
                         for p in &paths {
                             dialogs::open_in_explorer(p);
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Properties").clicked() {
                         let paths = self.get_selected_paths();
                         for p in &paths {
                             dialogs::show_properties(p);
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Rescan  (F9)").clicked() {
                         self.start_scan();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Quit  (Ctrl+Q)").clicked() {
@@ -927,12 +927,12 @@ impl eframe::App for GuiApp {
                         let paths = self.get_selected_paths();
                         dialogs::copy_to_clipboard(&paths.join("\n"));
                         self.status_message = format!("Copied {} path(s)", paths.len());
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Select All  (Ctrl+A)").clicked() {
                         let total = self.filtered_indices.len();
                         self.table.select_all(total);
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Rename").clicked() {
@@ -948,7 +948,7 @@ impl eframe::App for GuiApp {
                                 new_name: name,
                             };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Delete").clicked() {
                         let paths = self.get_selected_paths();
@@ -963,7 +963,7 @@ impl eframe::App for GuiApp {
                                 action: PendingAction::Delete,
                             };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -971,12 +971,12 @@ impl eframe::App for GuiApp {
                 ui.menu_button("View", |ui| {
                     if ui.button("Treemap  (T)").clicked() {
                         self.toggle_treemap();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Search Filters  (Ctrl+F)").clicked() {
                         self.active_dialog =
                             ActiveDialog::SearchFilters(self.search_filters.clone());
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -986,7 +986,7 @@ impl eframe::App for GuiApp {
                     for filter in &filters {
                         if ui.button(format!("Filter: {}", filter.name)).clicked() {
                             self.apply_preset_filter(filter);
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     ui.separator();
@@ -995,7 +995,7 @@ impl eframe::App for GuiApp {
                         self.search.query.clear();
                         self.search.needs_search = true;
                         self.status_message = "Filters cleared".to_string();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -1018,7 +1018,7 @@ impl eframe::App for GuiApp {
                                 "Click column headers to sort.".into(),
                             ],
                         };
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("About EmFit").clicked() {
                         self.active_dialog = ActiveDialog::Info {
@@ -1033,7 +1033,7 @@ impl eframe::App for GuiApp {
                                 "enumeration and accurate sizes.".into(),
                             ],
                         };
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });

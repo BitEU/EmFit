@@ -190,7 +190,7 @@ fn main() {
         }
         Some(Commands::Gui) => {
             // Launch GUI
-            emfit::gui::run();
+            let _ = emfit::gui::run();
         }
         Some(Commands::Cli { subcmd }) => {
             let result = match subcmd {
